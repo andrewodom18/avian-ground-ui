@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   ChevronDown,
   Image as ImageIcon,
+  Link2,
   MapPin,
   Plane,
   Radio,
@@ -15,6 +16,7 @@ import {
   ShieldCheck,
   TerminalSquare,
   WifiOff,
+  X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -76,6 +78,7 @@ type EventItem = { key: string; at: number; priority: number; source: string; te
 type EventLevel = "all" | "warning" | "error" | "info";
 type EventOrder = "newest" | "oldest";
 type MetricState = "good" | "warn" | "stale";
+type ConnectionResult = { name: string; connected: boolean };
 
 const AIRCRAFT_POLL_INTERVAL_MS = 2_000;
 const AIRCRAFT_FRESH_MS = 5_000;
@@ -175,6 +178,13 @@ async function fetchJson<T>(path: string, decode: (value: unknown) => T): Promis
   }
 }
 
+function decodeConnectionResponse(value: unknown): ConnectionResult {
+  if (!isObject(value) || typeof value.name !== "string" || typeof value.connected !== "boolean") {
+    throw new Error("Ground bridge returned an invalid connection response");
+  }
+  return { name: value.name, connected: value.connected };
+}
+
 function durationLabel(milliseconds: number): string {
   const minutes = Math.floor(milliseconds / 60_000);
   if (minutes < 60) return `${minutes}m`;
@@ -268,9 +278,21 @@ export function Dashboard() {
   const [eventQuery, setEventQuery] = useState("");
   const [eventOrder, setEventOrder] = useState<EventOrder>("newest");
   const [eventPage, setEventPage] = useState(1);
+  const [connectionOpen, setConnectionOpen] = useState(false);
+  const [connectionCode, setConnectionCode] = useState("");
+  const [connectionPending, setConnectionPending] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [connectionResult, setConnectionResult] = useState<ConnectionResult | null>(null);
   const statusInFlight = useRef(false);
   const aircraftInFlight = useRef(false);
   const secondaryInFlight = useRef(false);
+  const connectionField = useRef<HTMLTextAreaElement>(null);
+
+  const openConnection = useCallback(() => {
+    setConnectionError(null);
+    setConnectionResult(null);
+    setConnectionOpen(true);
+  }, []);
 
   const loadStatus = useCallback(async () => {
     if (statusInFlight.current) return;
@@ -342,6 +364,53 @@ export function Dashboard() {
     await Promise.all([loadStatus(), loadAircraft(), loadSecondary()]);
     setRefreshing(false);
   }, [loadAircraft, loadSecondary, loadStatus]);
+
+  const connectAircraft = useCallback(async () => {
+    const code = connectionCode.trim();
+    if (!code) {
+      setConnectionError("Paste the AVIAN connection code supplied with the aircraft");
+      return;
+    }
+    setConnectionPending(true);
+    setConnectionError(null);
+    setConnectionResult(null);
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 8_000);
+    try {
+      const response = await fetch("/api/v1/connections", {
+        method: "POST",
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json", "x-avian-setup": "1" },
+        body: JSON.stringify({ code }),
+        signal: controller.signal,
+      });
+      const payload: unknown = await response.json().catch(() => null);
+      if (!response.ok) {
+        const detail = isObject(payload) && typeof payload.detail === "string" ? payload.detail : `HTTP ${response.status}`;
+        throw new Error(detail);
+      }
+      const result = decodeConnectionResponse(payload);
+      setConnectionResult(result);
+      setConnectionCode("");
+      await Promise.all([loadStatus(), loadAircraft()]);
+    } catch (error) {
+      setConnectionError(fetchErrorLabel(error, "Aircraft connection"));
+    } finally {
+      window.clearTimeout(timer);
+      setConnectionPending(false);
+    }
+  }, [connectionCode, loadAircraft, loadStatus]);
+
+  useEffect(() => {
+    if (!connectionOpen) return;
+    connectionField.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !connectionPending) setConnectionOpen(false);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [connectionOpen, connectionPending]);
 
   useEffect(() => {
     const initialTimer = window.setTimeout(() => void refresh(), 0);
@@ -427,6 +496,9 @@ export function Dashboard() {
   const filtersActive = eventLevelFilter !== "all" || eventSourceFilter !== "all" || eventQuery !== "";
 
   const latestManifest = bulkRecords[0]?.published_at_ms ?? null;
+  const displayedConnectionResult = connectionResult && status?.peers.some(
+    (peer) => peer.name === connectionResult.name && peer.connected,
+  ) ? { ...connectionResult, connected: true } : connectionResult;
   const localMetricState: MetricState = bridgeError && status ? "stale" : status?.ready ? "good" : "warn";
   const aircraftMetricState: MetricState = liveAircraft.length > 0 && staleAircraft.length === 0 ? "good"
     : aircraft.length > 0 ? "stale" : "warn";
@@ -444,11 +516,36 @@ export function Dashboard() {
             {bridgeError ? (status ? "Local bridge interrupted" : "Local bridge offline") : status ? `Live · ${status.node.name}` : "Connecting to local bridge"}
             <span className="sync-time">{bridgeError && lastStatusAt ? `Last live ${clockLabel(lastStatusAt)}` : status && lastStatusAt ? `Snapshot ${clockLabel(lastStatusAt)}` : "Auto refresh 10s"}</span>
           </div>
+          <button className="connect-button" type="button" onClick={openConnection}>
+            <Link2 size={14} /> Connect aircraft
+          </button>
           <button className="refresh-button" type="button" onClick={() => void refresh()} disabled={refreshing}>
             <RefreshCw size={14} className={refreshing ? "spinning" : ""} /> Refresh now
           </button>
         </div>
       </header>
+
+      {connectionOpen ? (
+        <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !connectionPending) setConnectionOpen(false); }}>
+          <section className="connection-dialog" role="dialog" aria-modal="true" aria-labelledby="connection-title">
+            <div className="dialog-heading">
+              <div><p className="eyebrow">AIRCRAFT SETUP</p><h2 id="connection-title">Connect an aircraft</h2></div>
+              <button type="button" aria-label="Close aircraft setup" onClick={() => setConnectionOpen(false)} disabled={connectionPending}><X size={17} /></button>
+            </div>
+            <div className="dialog-body">
+              <p>Connect this device to the aircraft network, then paste the <strong>AVIAN1</strong> code supplied with the drone.</p>
+              <ol><li>Power on the aircraft computer.</li><li>Join its local or approved overlay network.</li><li>Paste the code and connect.</li></ol>
+              <label className="connection-field"><span>Aircraft connection code</span><textarea ref={connectionField} value={connectionCode} onChange={(event) => setConnectionCode(event.target.value)} placeholder="AVIAN1.…" rows={4} spellCheck={false} autoCapitalize="none" autoCorrect="off" disabled={connectionPending} /></label>
+              <p className="connection-privacy"><ShieldCheck size={14} /> The code contains routing details only. Formation credentials stay in the local AVIAN agent.</p>
+              {connectionError ? <p className="connection-message error" role="alert"><AlertTriangle size={15} />{connectionError}</p> : null}
+              {displayedConnectionResult ? <p className={`connection-message ${displayedConnectionResult.connected ? "success" : "pending"}`} role="status">{displayedConnectionResult.connected ? <CheckCircle2 size={15} /> : <RefreshCw size={15} className="spinning" />}{displayedConnectionResult.connected ? `${displayedConnectionResult.name} is connected` : `${displayedConnectionResult.name} was saved; AVIAN is attempting the first connection`}</p> : null}
+            </div>
+            <div className="dialog-actions"><button type="button" className="secondary-action" onClick={() => setConnectionOpen(false)} disabled={connectionPending}>Close</button><button type="button" className="primary-action" onClick={() => void connectAircraft()} disabled={connectionPending || !connectionCode.trim()}>{connectionPending ? <RefreshCw size={14} className="spinning" /> : <Link2 size={14} />}{connectionPending ? "Connecting…" : "Connect aircraft"}</button></div>
+          </section>
+        </div>
+      ) : null}
+
+      {status && status.peers.length === 0 ? <section className="setup-callout"><div><Link2 size={19} /><span><strong>No aircraft configured</strong><small>Add the connection code supplied with your drone.</small></span></div><button type="button" onClick={openConnection}>Connect aircraft</button></section> : null}
 
       {warnings.length > 0 ? (
         <details className="alert-strip">
@@ -549,7 +646,7 @@ export function Dashboard() {
         </article>
       </section>
 
-      <footer><ShieldCheck size={13} /> AVIAN Ground is observational only · Emergency actions remain in the operator CLI</footer>
+      <footer><ShieldCheck size={13} /> Flight operations are observational only · Connection setup changes local mesh membership</footer>
     </main>
   );
 }

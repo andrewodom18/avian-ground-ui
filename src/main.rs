@@ -6,12 +6,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
-use axum::extract::{Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -31,6 +32,8 @@ const MAX_CONTROL_BYTES: usize = 1_048_576;
 const MAX_LOG_BYTES: usize = 1_048_576;
 const MAX_LOG_LINES: usize = 200;
 const MAX_LOG_MESSAGE_CHARS: usize = 512;
+const MAX_CONNECTION_CODE_CHARS: usize = 8_192;
+const MAX_SETUP_BODY_BYTES: usize = 16_384;
 
 #[derive(Debug, Parser)]
 #[command(name = "avian-ground-ui", version, about)]
@@ -83,6 +86,43 @@ impl ApiError {
             detail: detail.into(),
         }
     }
+
+    fn forbidden(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "setup_forbidden",
+            detail: detail.into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectRequest {
+    code: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionCode {
+    schema_version: u16,
+    formation_id: String,
+    aircraft: ConnectionAircraft,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionAircraft {
+    name: String,
+    endpoint_id: String,
+    addresses: Vec<ConnectionAddress>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionAddress {
+    underlay: String,
+    address: SocketAddr,
 }
 
 impl IntoResponse for ApiError {
@@ -319,7 +359,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/aircraft", get(aircraft))
         .route("/api/v1/records", get(records))
         .route("/api/v1/logs", get(logs))
+        .route("/api/v1/connections", post(connect_aircraft))
         .fallback_service(static_files)
+        .layer(DefaultBodyLimit::max(MAX_SETUP_BODY_BYTES))
         .layer(ConcurrencyLimitLayer::new(64))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -416,8 +458,150 @@ async fn health() -> impl IntoResponse {
         "schema_version": 1,
         "service": "avian-ground-ui",
         "observed_at_ms": unix_time_ms(),
-        "read_only": true
+        "read_only": true,
+        "operations_read_only": true,
+        "connection_setup": true
     }))
+}
+
+async fn connect_aircraft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ConnectRequest>,
+) -> Result<Response, ApiError> {
+    if headers
+        .get("x-avian-setup")
+        .and_then(|value| value.to_str().ok())
+        != Some("1")
+    {
+        return Err(ApiError::forbidden("missing local setup confirmation"));
+    }
+    let connection = decode_connection_code(&request.code)?;
+    let body = state
+        .avian
+        .request(json!({
+            "type": "configure_peer",
+            "formation_id": connection.formation_id,
+            "name": connection.aircraft.name,
+            "endpoint_id": connection.aircraft.endpoint_id,
+            "addresses": connection.aircraft.addresses
+        }))
+        .await?;
+    if body.get("type").and_then(Value::as_str) == Some("error") {
+        let detail = body
+            .get("detail")
+            .and_then(Value::as_str)
+            .map(sanitize_message)
+            .unwrap_or_else(|| "aircraft connection was rejected".to_owned());
+        return Err(ApiError::bad_request(detail));
+    }
+    if body.get("type").and_then(Value::as_str) != Some("peer_configured") {
+        return Err(control_error(body));
+    }
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .map(sanitize_message)
+        .ok_or_else(|| {
+            ApiError::unavailable(
+                "invalid_control_response",
+                "configured peer name is missing",
+            )
+        })?;
+    let connected = body
+        .get("connected")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            ApiError::unavailable(
+                "invalid_control_response",
+                "configured peer connection state is missing",
+            )
+        })?;
+    Ok(api_json(json!({ "name": name, "connected": connected })))
+}
+
+fn decode_connection_code(value: &str) -> Result<ConnectionCode, ApiError> {
+    let value = value.trim();
+    if value.len() > MAX_CONNECTION_CODE_CHARS {
+        return Err(ApiError::bad_request("connection code is too long"));
+    }
+    let encoded = value
+        .strip_prefix("AVIAN1.")
+        .ok_or_else(|| ApiError::bad_request("connection code must start with AVIAN1."))?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ApiError::bad_request("connection code encoding is invalid"))?;
+    if decoded.len() > MAX_CONNECTION_CODE_CHARS {
+        return Err(ApiError::bad_request(
+            "decoded connection code is too large",
+        ));
+    }
+    let connection: ConnectionCode = serde_json::from_slice(&decoded)
+        .map_err(|_| ApiError::bad_request("connection code contents are invalid"))?;
+    if connection.schema_version != 1 {
+        return Err(ApiError::bad_request(
+            "connection code version is not supported",
+        ));
+    }
+    if !valid_setup_identifier(&connection.formation_id)
+        || !valid_setup_identifier(&connection.aircraft.name)
+    {
+        return Err(ApiError::bad_request(
+            "connection code contains an invalid formation or aircraft name",
+        ));
+    }
+    if connection.aircraft.endpoint_id.len() != 64
+        || !connection
+            .aircraft
+            .endpoint_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ApiError::bad_request(
+            "connection code contains an invalid aircraft identity",
+        ));
+    }
+    if connection.aircraft.addresses.is_empty() || connection.aircraft.addresses.len() > 8 {
+        return Err(ApiError::bad_request(
+            "connection code must contain 1-8 aircraft addresses",
+        ));
+    }
+    for address in &connection.aircraft.addresses {
+        if !matches!(
+            address.underlay.as_str(),
+            "silvus" | "ethernet" | "wifi" | "satellite" | "other"
+        ) || address.address.port() == 0
+            || !valid_connection_ip(address.address.ip())
+        {
+            return Err(ApiError::bad_request(
+                "connection code contains an invalid aircraft address",
+            ));
+        }
+    }
+    Ok(connection)
+}
+
+fn valid_connection_ip(value: std::net::IpAddr) -> bool {
+    match value {
+        std::net::IpAddr::V4(value) => {
+            !value.is_unspecified()
+                && !value.is_multicast()
+                && !value.is_loopback()
+                && !value.is_broadcast()
+        }
+        std::net::IpAddr::V6(value) => value.to_ipv4_mapped().map_or_else(
+            || !value.is_unspecified() && !value.is_multicast() && !value.is_loopback(),
+            |mapped| valid_connection_ip(mapped.into()),
+        ),
+    }
+}
+
+fn valid_setup_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 async fn agent_status(State(state): State<AppState>) -> Result<Response, ApiError> {
@@ -1148,6 +1332,68 @@ mod tests {
         let mut ipv6 = HeaderMap::new();
         ipv6.insert(header::HOST, HeaderValue::from_static("[::1]:4178"));
         assert_eq!(validate_request_headers(&ipv6, "[::1]:4178"), Ok(()));
+    }
+
+    #[test]
+    fn connection_code_is_bounded_strict_and_contains_no_formation_secret() {
+        let bundle = json!({
+            "schema_version": 1,
+            "formation_id": "mission-alpha",
+            "aircraft": {
+                "name": "aircraft-001",
+                "endpoint_id": "a".repeat(64),
+                "addresses": [
+                    {"underlay": "ethernet", "address": "192.0.2.4:9000"},
+                    {"underlay": "satellite", "address": "198.51.100.7:9000"}
+                ]
+            }
+        });
+        let code = format!(
+            "AVIAN1.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&bundle).unwrap())
+        );
+        let decoded = decode_connection_code(&code).unwrap();
+        assert_eq!(decoded.formation_id, "mission-alpha");
+        assert_eq!(decoded.aircraft.name, "aircraft-001");
+        assert_eq!(decoded.aircraft.addresses.len(), 2);
+
+        let mut with_secret = bundle;
+        with_secret["formation_key"] = json!("must-not-be-accepted");
+        let code = format!(
+            "AVIAN1.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&with_secret).unwrap())
+        );
+        assert!(decode_connection_code(&code).is_err());
+        assert!(decode_connection_code(&format!(
+            "AVIAN1.{}",
+            "a".repeat(MAX_CONNECTION_CODE_CHARS)
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn connection_code_rejects_loopback_and_unknown_underlays() {
+        for (underlay, address) in [
+            ("ethernet", "127.0.0.1:9000"),
+            ("ethernet", "255.255.255.255:9000"),
+            ("ethernet", "[::ffff:127.0.0.1]:9000"),
+            ("unknown", "192.0.2.4:9000"),
+        ] {
+            let bundle = json!({
+                "schema_version": 1,
+                "formation_id": "mission-alpha",
+                "aircraft": {
+                    "name": "aircraft-001",
+                    "endpoint_id": "a".repeat(64),
+                    "addresses": [{"underlay": underlay, "address": address}]
+                }
+            });
+            let code = format!(
+                "AVIAN1.{}",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&bundle).unwrap())
+            );
+            assert!(decode_connection_code(&code).is_err());
+        }
     }
 
     #[test]
