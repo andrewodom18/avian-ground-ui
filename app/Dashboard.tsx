@@ -33,7 +33,7 @@ type Underlay = {
 type AgentStatus = {
   schema_version: number;
   ready: boolean;
-  node: { name: string; uptime_ms: number };
+  node: { name: string; role: "ground" | "aircraft" | "observer"; uptime_ms: number };
   peers: Array<{
     name: string;
     connected: boolean;
@@ -98,7 +98,9 @@ function isNumberOrNull(value: unknown): value is number | null {
 
 function isAgentStatus(value: unknown): value is AgentStatus {
   if (!isObject(value) || value.schema_version !== 1 || typeof value.ready !== "boolean") return false;
-  if (!isObject(value.node) || typeof value.node.name !== "string" || typeof value.node.uptime_ms !== "number") return false;
+  if (!isObject(value.node) || typeof value.node.name !== "string"
+    || !["ground", "aircraft", "observer"].includes(String(value.node.role))
+    || typeof value.node.uptime_ms !== "number") return false;
   if (!Array.isArray(value.peers) || !value.peers.every((peer) => isObject(peer)
     && typeof peer.name === "string" && typeof peer.connected === "boolean"
     && (peer.selected_underlay === null || typeof peer.selected_underlay === "string")
@@ -592,9 +594,9 @@ export function Dashboard() {
             {bridgeError ? (status ? "Local bridge interrupted" : "Local bridge offline") : status ? `Live · ${status.node.name}` : "Connecting to local bridge"}
             <span className="sync-time">{bridgeError && lastStatusAt ? `Last live ${clockLabel(lastStatusAt)}` : status && lastStatusAt ? `Snapshot ${clockLabel(lastStatusAt)}` : "Auto refresh 10s"}</span>
           </div>
-          <button className="connect-button" type="button" onClick={openConnection}>
+          {status?.node.role === "ground" ? <button className="connect-button" type="button" onClick={openConnection}>
             <Link2 size={14} /> Manage aircraft
-          </button>
+          </button> : null}
           <button className="refresh-button" type="button" onClick={() => void refresh()} disabled={refreshing}>
             <RefreshCw size={14} className={refreshing ? "spinning" : ""} /> Refresh now
           </button>
@@ -632,7 +634,7 @@ export function Dashboard() {
         </div>
       ) : null}
 
-      {status && status.peers.length === 0 ? <section className="setup-callout"><div><Link2 size={19} /><span><strong>No direct aircraft peers saved</strong><small>Add a connection code so this ground agent can initiate and retry the link.</small></span></div><button type="button" onClick={openConnection}>Connect aircraft</button></section> : null}
+      {status?.node.role === "ground" && status.peers.length === 0 ? <section className="setup-callout"><div><Link2 size={19} /><span><strong>No direct aircraft peers saved</strong><small>Add a connection code so this ground agent can initiate and retry the link.</small></span></div><button type="button" onClick={openConnection}>Connect aircraft</button></section> : null}
 
       {warnings.length > 0 ? (
         <details className="alert-strip">

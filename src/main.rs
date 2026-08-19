@@ -177,6 +177,7 @@ struct StatusInput {
 #[derive(Debug, Deserialize)]
 struct NodeInput {
     name: String,
+    role: String,
     uptime_ms: u64,
 }
 
@@ -242,6 +243,7 @@ struct DashboardStatus {
 #[derive(Debug, Serialize)]
 struct DashboardNode {
     name: String,
+    role: String,
     uptime_ms: u64,
 }
 
@@ -882,6 +884,15 @@ fn project_status(input: StatusInput) -> Result<DashboardStatus, ApiError> {
         ready: input.ready,
         node: DashboardNode {
             name: sanitize_message(&input.node.name),
+            role: match input.node.role.as_str() {
+                "ground" | "aircraft" | "observer" => input.node.role,
+                _ => {
+                    return Err(ApiError::unavailable(
+                        "invalid_control_response",
+                        "status contains an invalid node role",
+                    ));
+                }
+            },
             uptime_ms: input.node.uptime_ms,
         },
         peers: input
