@@ -1,6 +1,6 @@
 # AVIAN Ground UI
 
-A lightweight, read-only field dashboard for AVIAN ground devices. It surfaces
+A lightweight, operationally read-only field dashboard for AVIAN ground devices. It surfaces
 local agent readiness, mesh peers, selected underlays, synchronized aircraft
 telemetry, radio health, payload synchronization, warnings, and bounded
 sanitized service logs. Aircraft telemetry refreshes every 2 seconds, status
@@ -19,8 +19,11 @@ pagination.
 - Every request must use the exact configured loopback `Host`; browser `Origin`
   headers, when present, must match that same HTTP origin. This blocks DNS
   rebinding and cross-origin reads of the local service.
-- The API contains only health, status, record-listing, and fixed AVIAN journal
-  queries. There is no emergency-command or mutation route.
+- Flight APIs contain only health, status, record-listing, and fixed AVIAN
+  journal queries. There is no emergency-command route. The one local mutation
+  route accepts only a bounded, versioned `AVIAN1` aircraft connection code,
+  requires an explicit setup header, and forwards a validated public peer
+  descriptor to the owner-only local agent.
 - Status and aircraft telemetry are parsed and projected into fixed display
   schemas. The aircraft projection contains only flight state needed by the
   operator: source, observation time, position and its availability, altitude, velocity, attitude,
@@ -51,7 +54,7 @@ loopback with a restrictive systemd sandbox.
 
 ```text
 Browser on ground device
-        │ HTTP 127.0.0.1:4178 (read only)
+        │ HTTP 127.0.0.1:4178 (flight view + local aircraft setup)
         ▼
 avian-ground-ui (Rust)
         ├── local ground-agent socket  status + synchronized records only
@@ -102,6 +105,30 @@ On macOS, where systemd's journal is not present, add `--disable-journal` and
 point `--control-socket` at the local ground agent's Unix socket.
 
 Open [http://127.0.0.1:4178/](http://127.0.0.1:4178/).
+
+## Connect an aircraft
+
+The aircraft and ground installation must already have the same protected
+formation credential. The credential is never put in the browser or connection
+code.
+
+1. Power on the aircraft and join its local or approved overlay network.
+2. Select **Connect aircraft** in AVIAN Ground.
+3. Paste the aircraft's `AVIAN1.` code and select **Connect aircraft**.
+
+The local agent validates the formation and public peer descriptor, persists it
+atomically in its private state, and attempts the connection immediately. No
+SSH, TOML editing, endpoint-ID copying, or service restart is required. An
+aircraft provisioner creates the non-secret code on the aircraft with:
+
+```sh
+sudo avianctl connection-code \
+  --address ethernet=192.168.2.2:9000 \
+  --address satellite=10.210.122.229:9000
+```
+
+Connection codes are for simple pre-provisioned ground formations. Managed
+formations continue to use AVIAN membership manifests.
 
 ## Flight operation
 
@@ -168,6 +195,7 @@ journalctl -u avian-ground-ui.service --since today
 | `GET /api/v1/aircraft` | Latest validated synchronized flight state per aircraft | telemetry only, 100 records, 3 s / 1 MiB |
 | `GET /api/v1/records?class=bulk&limit=20` | Publication timestamps only | bulk/ack allowlist, 1–100 |
 | `GET /api/v1/logs?lines=80` | AVIAN mesh/link service journal | fixed units, 1–200 lines / 1 MiB |
+| `POST /api/v1/connections` | Validate and persist one public aircraft descriptor | same-origin + setup header, 16 KiB body, no formation secret |
 
 All API responses are non-cacheable and carry restrictive browser security
 headers. Static assets are served from the same origin. Requests with any other
