@@ -615,16 +615,16 @@ export function Dashboard() {
               <p className="connection-privacy"><ShieldCheck size={14} /> The code contains routing details only. Formation credentials stay in the local AVIAN agent.</p>
               {connectionError ? <p className="connection-message error" role="alert"><AlertTriangle size={15} />{connectionError}</p> : null}
               {displayedConnectionResult ? <p className={`connection-message ${displayedConnectionResult.connected ? "success" : "pending"}`} role="status">{displayedConnectionResult.connected ? <CheckCircle2 size={15} /> : <RefreshCw size={15} className="spinning" />}{displayedConnectionResult.connected ? `${displayedConnectionResult.name} is connected` : `${displayedConnectionResult.name} was saved; AVIAN is attempting the first connection`}</p> : null}
-              {removalResult ? <p className="connection-message success" role="status"><CheckCircle2 size={15} />{removalResult.name} was removed from this ground device</p> : null}
+              {removalResult ? <p className="connection-message success" role="status"><CheckCircle2 size={15} />{removalResult.name} was removed from saved direct peers</p> : null}
               <section className="saved-connections" aria-labelledby="saved-connections-title">
-                <div className="saved-connections-heading"><div><strong id="saved-connections-title">Saved aircraft</strong><small>Connection-code pairings on this ground device</small></div><button type="button" onClick={() => void loadConnections()} disabled={setupPending}><RefreshCw size={13} /> Refresh</button></div>
+                <div className="saved-connections-heading"><div><strong id="saved-connections-title">Saved aircraft</strong><small>Code-added direct peers on this ground device</small></div><button type="button" onClick={() => void loadConnections()} disabled={setupPending}><RefreshCw size={13} /> Refresh</button></div>
                 {connectionListError ? <p className="saved-connections-error" role="alert"><AlertTriangle size={14} />{connectionListError}</p> : savedConnections.length ? <ul>{savedConnections.map((name) => {
                   const connectedPeer = status?.peers.find((peer) => peer.name === name);
                   const confirming = removeConfirmName === name;
                   const removing = removalPending === name;
                   return <li key={name}><span><strong>{name}</strong><small>{connectedPeer?.connected ? "Connected" : "Saved locally"}</small></span><div>{confirming ? <><button type="button" className="cancel-removal" onClick={() => setRemoveConfirmName(null)} disabled={removing}>Cancel</button><button type="button" className="confirm-removal" onClick={() => void removeAircraft(name)} disabled={removing}>{removing ? <RefreshCw size={13} className="spinning" /> : <Trash2 size={13} />}{removing ? "Removing…" : "Confirm remove"}</button></> : <button type="button" className="remove-connection" onClick={() => { setRemoveConfirmName(name); setConnectionError(null); setRemovalResult(null); }} disabled={setupPending}><Trash2 size={13} /> Remove</button>}</div></li>;
                 })}</ul> : <p className="saved-connections-empty">{connectionsLoaded ? "No connection-code aircraft are saved." : "Loading saved aircraft…"}</p>}
-                <p className="saved-connections-note">Removal stops reconnection from this ground device. It does not change the aircraft; previously synchronized telemetry may remain briefly as history.</p>
+                <p className="saved-connections-note">Removal deletes the saved direct peer and stops outbound retries. It does not revoke formation access, so authorized telemetry may still arrive over an aircraft-initiated or relayed mesh path.</p>
               </section>
             </div>
             <div className="dialog-actions"><button type="button" className="secondary-action" onClick={() => setConnectionOpen(false)} disabled={setupPending}>Close</button><button type="button" className="primary-action" onClick={() => void connectAircraft()} disabled={setupPending || !connectionCode.trim()}>{connectionPending ? <RefreshCw size={14} className="spinning" /> : <Link2 size={14} />}{connectionPending ? "Connecting…" : "Connect aircraft"}</button></div>
@@ -632,7 +632,7 @@ export function Dashboard() {
         </div>
       ) : null}
 
-      {status && status.peers.length === 0 ? <section className="setup-callout"><div><Link2 size={19} /><span><strong>No aircraft configured</strong><small>Add the connection code supplied with your drone.</small></span></div><button type="button" onClick={openConnection}>Connect aircraft</button></section> : null}
+      {status && status.peers.length === 0 ? <section className="setup-callout"><div><Link2 size={19} /><span><strong>No direct aircraft peers saved</strong><small>Add a connection code so this ground agent can initiate and retry the link.</small></span></div><button type="button" onClick={openConnection}>Connect aircraft</button></section> : null}
 
       {warnings.length > 0 ? (
         <details className="alert-strip">
@@ -651,7 +651,7 @@ export function Dashboard() {
 
       <section className="metric-grid" aria-label="Mission health summary">
         <Metric title="Ground agent" value={status ? (status.ready ? "Ready" : "Degraded") : "Unavailable"} state={localMetricState} detail={status ? `Uptime ${durationLabel(status.node.uptime_ms)}` : "Waiting for local bridge"} icon={<ShieldCheck size={17} />} />
-        <Metric title="Connected peers" value={status ? `${connected} / ${status.peers.length}` : "—"} state={bridgeError && status ? "stale" : status && !disconnected.length ? "good" : "warn"} detail={!status ? "Waiting for live peer status" : disconnected.length ? `${disconnected.length} reconnect in progress` : "All configured peers connected"} icon={<Activity size={17} />} />
+        <Metric title="Configured peers" value={status ? `${connected} / ${status.peers.length}` : "—"} state={bridgeError && status ? "stale" : status && !disconnected.length ? "good" : "warn"} detail={!status ? "Waiting for live peer status" : disconnected.length ? `${disconnected.length} reconnect in progress` : status.peers.length ? "All configured peers connected" : "No outbound direct peers saved"} icon={<Activity size={17} />} />
         <Metric title="Aircraft feed" value={aircraftLoaded ? `${liveAircraft.length} live` : "Waiting"} state={aircraftMetricState} detail={staleAircraft.length ? `${staleAircraft.length} last-known snapshot${staleAircraft.length === 1 ? "" : "s"}` : liveAircraft.length ? "Mesh telemetry current" : "No synchronized aircraft yet"} icon={<Plane size={17} />} />
         <Metric title="Radio monitor" value={!status ? "—" : !status.radio.required ? "Optional" : status.radio.fresh ? "Healthy" : "Degraded"} state={bridgeError && status ? "stale" : status && (status.radio.fresh || !status.radio.required) ? "good" : "warn"} detail={!status ? "Waiting for live radio status" : !status.radio.required ? "Passive underlay monitoring" : status.radio.fresh ? "Observation current" : "Required observation unavailable"} icon={<Satellite size={17} />} />
       </section>

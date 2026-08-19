@@ -106,14 +106,14 @@ point `--control-socket` at the local ground agent's Unix socket.
 
 Open [http://127.0.0.1:4178/](http://127.0.0.1:4178/).
 
-## Connect an aircraft
+## Connect or remove an aircraft
 
 The aircraft and ground installation must already have the same protected
 formation credential. The credential is never put in the browser or connection
 code.
 
 1. Power on the aircraft and join its local or approved overlay network.
-2. Select **Connect aircraft** in AVIAN Ground.
+2. Select **Manage aircraft** in AVIAN Ground.
 3. Paste the aircraft's `AVIAN1.` code and select **Connect aircraft**.
 
 The local agent validates the formation and public peer descriptor, persists it
@@ -129,6 +129,16 @@ sudo avianctl connection-code \
 
 Connection codes are for simple pre-provisioned ground formations. Managed
 formations continue to use AVIAN membership manifests.
+
+To remove a code-added aircraft from this ground device, open **Manage
+aircraft**, select **Remove** beside its name, then select **Confirm remove**.
+The local agent atomically removes the saved public descriptor, stops
+outbound reconnection attempts, and closes its currently tracked transport. It
+does not modify the aircraft or revoke formation membership or credentials.
+An authorized aircraft or formation peer can still establish an inbound or
+relayed mesh path, and synchronized telemetry remains subject to normal record
+retention. Paste the code again to restore the ground-initiated direct pairing.
+Static and managed-membership peers are never offered for removal.
 
 ## Flight operation
 
@@ -195,7 +205,9 @@ journalctl -u avian-ground-ui.service --since today
 | `GET /api/v1/aircraft` | Latest validated synchronized flight state per aircraft | telemetry only, 100 records, 3 s / 1 MiB |
 | `GET /api/v1/records?class=bulk&limit=20` | Publication timestamps only | bulk/ack allowlist, 1–100 |
 | `GET /api/v1/logs?lines=80` | AVIAN mesh/link service journal | fixed units, 1–200 lines / 1 MiB |
+| `GET /api/v1/connections` | List removable connection-code aircraft by name | no addresses, identities, or credentials |
 | `POST /api/v1/connections` | Validate and persist one public aircraft descriptor | same-origin + setup header, 16 KiB body, no formation secret |
+| `DELETE /api/v1/connections/{name}` | Remove one connection-code aircraft from this ground device | same-origin + setup header, validated name, static/managed peers rejected |
 
 All API responses are non-cacheable and carry restrictive browser security
 headers. Static assets are served from the same origin. Requests with any other

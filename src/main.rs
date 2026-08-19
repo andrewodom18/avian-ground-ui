@@ -491,6 +491,7 @@ async fn connect_aircraft(
 ) -> Result<Response, ApiError> {
     require_setup_confirmation(&headers)?;
     let connection = decode_connection_code(&request.code)?;
+    let expected_name = connection.aircraft.name.clone();
     let body = state
         .avian
         .request(json!({
@@ -515,11 +516,12 @@ async fn connect_aircraft(
     let name = body
         .get("name")
         .and_then(Value::as_str)
-        .map(sanitize_message)
+        .filter(|name| valid_setup_identifier(name) && *name == expected_name.as_str())
+        .map(str::to_owned)
         .ok_or_else(|| {
             ApiError::unavailable(
                 "invalid_control_response",
-                "configured peer name is missing",
+                "configured peer name is missing or mismatched",
             )
         })?;
     let connected = body
