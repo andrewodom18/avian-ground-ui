@@ -87,6 +87,25 @@ cargo run --locked -- --assets ground-dist --control-socket /run/avian/control.s
 
 Open [http://127.0.0.1:4178/](http://127.0.0.1:4178/).
 
+## Remote operator access
+
+Keep the service on loopback and use an SSH tunnel when the browser runs on a
+separate operator laptop:
+
+```sh
+ssh -N -L 4178:127.0.0.1:4178 operator@ground-device
+```
+
+Then open [http://127.0.0.1:4178/](http://127.0.0.1:4178/) on the laptop. The
+dashboard and AVIAN services continue running if the laptop link is removed,
+but an SSH tunnel cannot migrate between Ethernet, Wi-Fi, and overlay paths;
+reconnect it through a currently reachable device address. The UI is not a
+ground-device network dependency and its loss does not stop mesh operation.
+
+`jq` is not required. Operators may install it for interactive shell filtering,
+but the service, installer, checks, and runbooks rely only on their declared
+Rust, Node.js, system, and Python tooling.
+
 ## Linux installation
 
 Install AVIAN first, then:
