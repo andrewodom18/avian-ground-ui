@@ -3,6 +3,10 @@
 A lightweight, read-only field dashboard for AVIAN ground devices. It surfaces
 live agent readiness, mesh peers, selected underlays, MAVLink freshness, radio
 health, payload synchronization, warnings, and bounded sanitized service logs.
+Status refreshes every 10 seconds, while the heavier log and record feeds
+refresh every 30 seconds; background tabs pause polling and manual refresh is
+always available. Active warnings expand in place, and the bounded 200-entry
+event view supports search, severity/service filters, ordering, and pagination.
 
 ![AVIAN ground network preview](public/avian-ground-preview.png)
 

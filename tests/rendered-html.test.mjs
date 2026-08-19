@@ -21,6 +21,17 @@ test("server-renders the AVIAN operations shell", async () => {
   const html = await response.text();
   assert.match(html, /<title>AVIAN Ground \| Operations<\/title>/i);
   assert.match(html, /Operations overview/);
+  assert.match(html, /Auto refresh 10s/i);
+  assert.match(html, /active warning/i);
+  assert.match(html, /Event filters/i);
+  assert.match(html, /Message or service/i);
+  assert.match(html, /Severity/i);
+  assert.match(html, /All services/i);
+  assert.match(html, /Newest first/i);
+  assert.match(html, /aria-label="Event pages"/i);
+  assert.match(html, /Previous/i);
+  assert.match(html, /Next/i);
+  assert.doesNotMatch(html, /updated never|additional warnings/i);
   assert.match(html, /observational only/i);
   assert.doesNotMatch(html, /emergency rtl|return to launch/i);
 });

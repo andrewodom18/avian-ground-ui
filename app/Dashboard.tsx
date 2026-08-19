@@ -4,6 +4,7 @@ import {
   Activity,
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
   Image as ImageIcon,
   Radio,
   RefreshCw,
@@ -51,6 +52,13 @@ type AgentStatus = {
 
 type LogEntry = { timestamp_ms: number; unit: string; priority: number; message: string };
 type RecordView = { published_at_ms: number };
+type EventItem = { key: string; at: number; priority: number; source: string; text: string };
+type EventLevel = "all" | "warning" | "error" | "info";
+type EventOrder = "newest" | "oldest";
+
+const STATUS_POLL_INTERVAL_MS = 10_000;
+const SECONDARY_POLL_INTERVAL_MS = 30_000;
+const EVENT_PAGE_SIZE = 8;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -119,15 +127,6 @@ async function fetchJson<T>(path: string, decode: (value: unknown) => T): Promis
   }
 }
 
-function ageLabel(timestamp: number | null | undefined, now: number): string {
-  if (!timestamp) return "never";
-  const seconds = Math.max(0, Math.round((now - timestamp) / 1_000));
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  return `${Math.floor(minutes / 60)}h ago`;
-}
-
 function durationLabel(milliseconds: number): string {
   const minutes = Math.floor(milliseconds / 60_000);
   if (minutes < 60) return `${minutes}m`;
@@ -137,6 +136,40 @@ function durationLabel(milliseconds: number): string {
 
 function numberLabel(value: number | null | undefined, suffix = ""): string {
   return value == null || !Number.isFinite(value) ? "—" : `${Math.round(value)}${suffix}`;
+}
+
+function fetchErrorLabel(error: unknown, subject: string): string {
+  if (error instanceof DOMException && error.name === "AbortError") return `${subject} request timed out`;
+  if (error instanceof TypeError) return `${subject} could not reach the local bridge`;
+  if (error instanceof Error && error.message) return `${subject}: ${error.message}`;
+  return `${subject} is unavailable`;
+}
+
+function timestampLabel(timestamp: number | null | undefined): string {
+  if (!timestamp) return "None";
+  return new Date(timestamp).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function eventTimeLabel(timestamp: number): string {
+  return new Date(timestamp).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+function eventLevel(priority: number): Exclude<EventLevel, "all"> {
+  if (priority <= 3) return "error";
+  if (priority === 4) return "warning";
+  return "info";
 }
 
 export function Dashboard() {
@@ -149,10 +182,12 @@ export function Dashboard() {
   const [recordError, setRecordError] = useState<string | null>(null);
   const [logsLoaded, setLogsLoaded] = useState(false);
   const [recordsLoaded, setRecordsLoaded] = useState(false);
-  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
-  const [secondaryUpdatedAt, setSecondaryUpdatedAt] = useState<number | null>(null);
-  const [now, setNow] = useState(() => Date.now());
   const [refreshing, setRefreshing] = useState(false);
+  const [eventLevelFilter, setEventLevelFilter] = useState<EventLevel>("all");
+  const [eventSourceFilter, setEventSourceFilter] = useState("all");
+  const [eventQuery, setEventQuery] = useState("");
+  const [eventOrder, setEventOrder] = useState<EventOrder>("newest");
+  const [eventPage, setEventPage] = useState(1);
   const statusInFlight = useRef(false);
   const secondaryInFlight = useRef(false);
 
@@ -162,11 +197,10 @@ export function Dashboard() {
     try {
       const response = await fetchJson("/api/v1/status", decodeStatusResponse);
       setStatus(response.status);
-      setUpdatedAt(Date.now());
       setBridgeError(null);
     } catch (error) {
       setStatus(null);
-      setBridgeError(error instanceof Error ? error.message : "Ground bridge unavailable");
+      setBridgeError(fetchErrorLabel(error, "AVIAN status"));
     } finally {
       statusInFlight.current = false;
     }
@@ -177,7 +211,7 @@ export function Dashboard() {
     secondaryInFlight.current = true;
     try {
       const results = await Promise.allSettled([
-        fetchJson("/api/v1/logs?lines=80", decodeLogResponse),
+        fetchJson("/api/v1/logs?lines=200", decodeLogResponse),
         fetchJson("/api/v1/records?class=bulk&limit=20", decodeRecordResponse),
         fetchJson("/api/v1/records?class=acknowledgement&limit=20", decodeRecordResponse),
       ]);
@@ -188,7 +222,7 @@ export function Dashboard() {
       } else {
         setLogs([]);
         setLogsLoaded(false);
-        setLogError("Service log feed is unavailable");
+        setLogError(fetchErrorLabel(results[0].reason, "Service logs"));
       }
       if (results[1].status === "fulfilled") setBulkRecords(results[1].value.records);
       else setBulkRecords([]);
@@ -197,10 +231,13 @@ export function Dashboard() {
       if (results[1].status === "fulfilled" && results[2].status === "fulfilled") {
         setRecordsLoaded(true);
         setRecordError(null);
-        setSecondaryUpdatedAt(Date.now());
       } else {
         setRecordsLoaded(false);
-        setRecordError("Record feed is unavailable");
+        const failures = [
+          results[1].status === "rejected" ? fetchErrorLabel(results[1].reason, "Payload manifests") : null,
+          results[2].status === "rejected" ? fetchErrorLabel(results[2].reason, "Payload acknowledgements") : null,
+        ].filter((value): value is string => value !== null);
+        setRecordError(failures.join("; "));
       }
     } finally {
       secondaryInFlight.current = false;
@@ -215,14 +252,21 @@ export function Dashboard() {
 
   useEffect(() => {
     const initialTimer = window.setTimeout(() => void refresh(), 0);
-    const statusTimer = window.setInterval(() => void loadStatus(), 1_000);
-    const secondaryTimer = window.setInterval(() => void loadSecondary(), 5_000);
-    const clockTimer = window.setInterval(() => setNow(Date.now()), 1_000);
+    const statusTimer = window.setInterval(() => {
+      if (!document.hidden) void loadStatus();
+    }, STATUS_POLL_INTERVAL_MS);
+    const secondaryTimer = window.setInterval(() => {
+      if (!document.hidden) void loadSecondary();
+    }, SECONDARY_POLL_INTERVAL_MS);
+    const onVisibilityChange = () => {
+      if (!document.hidden) void refresh();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       window.clearTimeout(initialTimer);
       window.clearInterval(statusTimer);
       window.clearInterval(secondaryTimer);
-      window.clearInterval(clockTimer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [loadSecondary, loadStatus, refresh]);
 
@@ -241,11 +285,39 @@ export function Dashboard() {
     return values;
   }, [bridgeError, disconnected.length, logError, recordError, status]);
 
-  const recentErrors = status?.last_errors.slice(-8).reverse() ?? [];
-  const events: Array<{ key: string; at: number; priority: number; source: string; text: string }> = [
-    ...recentErrors.map((error) => ({ key: `error-${error.component}-${error.at_ms}`, at: error.at_ms, priority: 3, source: error.component, text: error.detail })),
-    ...logs.map((entry, index) => ({ key: `log-${entry.timestamp_ms}-${index}`, at: entry.timestamp_ms, priority: entry.priority, source: entry.unit, text: entry.message })),
-  ].sort((a, b) => b.at - a.at).slice(0, 12);
+  const events = useMemo<EventItem[]>(() => [
+    ...(status?.last_errors ?? []).map((error) => ({
+      key: `error-${error.component}-${error.at_ms}`,
+      at: error.at_ms,
+      priority: 3,
+      source: error.component,
+      text: error.detail,
+    })),
+    ...logs.map((entry, index) => ({
+      key: `log-${entry.timestamp_ms}-${index}`,
+      at: entry.timestamp_ms,
+      priority: entry.priority,
+      source: entry.unit,
+      text: entry.message,
+    })),
+  ], [logs, status?.last_errors]);
+  const eventSources = useMemo(
+    () => Array.from(new Set(events.map((event) => event.source))).sort((a, b) => a.localeCompare(b)),
+    [events],
+  );
+  const filteredEvents = useMemo(() => {
+    const query = eventQuery.trim().toLocaleLowerCase();
+    return events
+      .filter((event) => eventLevelFilter === "all" || eventLevel(event.priority) === eventLevelFilter)
+      .filter((event) => eventSourceFilter === "all" || event.source === eventSourceFilter)
+      .filter((event) => !query || `${event.source} ${event.text}`.toLocaleLowerCase().includes(query))
+      .sort((a, b) => eventOrder === "newest" ? b.at - a.at : a.at - b.at);
+  }, [eventLevelFilter, eventOrder, eventQuery, eventSourceFilter, events]);
+  const eventPageCount = Math.max(1, Math.ceil(filteredEvents.length / EVENT_PAGE_SIZE));
+  const currentEventPage = Math.min(eventPage, eventPageCount);
+  const pageStart = (currentEventPage - 1) * EVENT_PAGE_SIZE;
+  const pagedEvents = filteredEvents.slice(pageStart, pageStart + EVENT_PAGE_SIZE);
+  const filtersActive = eventLevelFilter !== "all" || eventSourceFilter !== "all" || eventQuery !== "";
 
   const latestManifest = bulkRecords[0]?.published_at_ms ?? null;
 
@@ -260,7 +332,7 @@ export function Dashboard() {
           <div className={`sync-state ${bridgeError ? "offline" : !status ? "connecting" : ""}`} role="status">
             {bridgeError ? <WifiOff size={15} /> : status ? <CheckCircle2 size={15} /> : <RefreshCw size={15} className="spinning" />}
             {bridgeError ? "Bridge offline" : status ? `Live · ${status.node.name}` : "Connecting to local bridge"}
-            <span className="sync-time">updated {ageLabel(updatedAt, now)}</span>
+            <span className="sync-time">Auto refresh 10s</span>
           </div>
           <button className="refresh-button" type="button" onClick={() => void refresh()} disabled={refreshing}>
             <RefreshCw size={14} className={refreshing ? "spinning" : ""} /> Refresh now
@@ -269,10 +341,16 @@ export function Dashboard() {
       </header>
 
       {warnings.length > 0 ? (
-        <section className="alert-strip" aria-label="Active warnings">
-          <div><AlertTriangle size={18} /><strong>{warnings[0]}</strong></div>
-          <span>{warnings.length > 1 ? `+${warnings.length - 1} additional warning${warnings.length === 2 ? "" : "s"}` : "Flight and payload services remain independent."}</span>
-        </section>
+        <details className="alert-strip">
+          <summary>
+            <span className="alert-primary"><AlertTriangle size={18} /><strong>{warnings[0]}</strong></span>
+            <span className="warning-count">{warnings.length} active warning{warnings.length === 1 ? "" : "s"}<ChevronDown size={15} /></span>
+          </summary>
+          <div className="alert-details" aria-label="Active warning details">
+            <p>Review each warning below. Use Refresh now after correcting the underlying service.</p>
+            <ol>{warnings.map((warning, index) => <li key={`${warning}-${index}`}>{warning}</li>)}</ol>
+          </div>
+        </details>
       ) : (
         <section className="healthy-strip"><ShieldCheck size={18} /><strong>All configured acceptance requirements are healthy</strong></section>
       )}
@@ -280,8 +358,8 @@ export function Dashboard() {
       <section className="metric-grid" aria-label="Mission health summary">
         <Metric title="Agent readiness" value={status ? (status.ready ? "Ready" : "Degraded") : "Unavailable"} state={status?.ready ? "good" : "warn"} detail={status ? `Uptime ${durationLabel(status.node.uptime_ms)}` : "Waiting for local bridge"} icon={<ShieldCheck size={17} />} />
         <Metric title="Connected peers" value={status ? `${connected} / ${status.peers.length}` : "—"} state={status && !disconnected.length ? "good" : "warn"} detail={!status ? "Waiting for live peer status" : disconnected.length ? `${disconnected.length} reconnect in progress` : "All configured peers connected"} icon={<Activity size={17} />} />
-        <Metric title="MAVLink" value={!status ? "—" : !status.mavlink.required ? "Optional" : status.mavlink.connected ? "Locked" : "Offline"} state={status && (status.mavlink.connected || !status.mavlink.required) ? "good" : "warn"} detail={!status ? "Waiting for live MAVLink status" : status.mavlink.target_system_id != null ? `System ${status.mavlink.target_system_id} · ${ageLabel(status.mavlink.last_message_at_ms, now)}` : "No current system lock"} icon={<Radio size={17} />} />
-        <Metric title="Radio monitor" value={!status ? "—" : !status.radio.required ? "Optional" : status.radio.fresh ? "Healthy" : "Degraded"} state={status && (status.radio.fresh || !status.radio.required) ? "good" : "warn"} detail={status ? `Observed ${ageLabel(status.radio.last_observation_at_ms, now)}` : "Waiting for live radio status"} icon={<Satellite size={17} />} />
+        <Metric title="MAVLink" value={!status ? "—" : !status.mavlink.required ? "Optional" : status.mavlink.connected ? "Locked" : "Offline"} state={status && (status.mavlink.connected || !status.mavlink.required) ? "good" : "warn"} detail={!status ? "Waiting for live MAVLink status" : status.mavlink.target_system_id != null ? `System ${status.mavlink.target_system_id}` : "No current system lock"} icon={<Radio size={17} />} />
+        <Metric title="Radio monitor" value={!status ? "—" : !status.radio.required ? "Optional" : status.radio.fresh ? "Healthy" : "Degraded"} state={status && (status.radio.fresh || !status.radio.required) ? "good" : "warn"} detail={!status ? "Waiting for live radio status" : !status.radio.required ? "Monitoring disabled" : status.radio.fresh ? "Observation current" : "Required observation unavailable"} icon={<Satellite size={17} />} />
       </section>
 
       <section className="content-grid">
@@ -308,15 +386,26 @@ export function Dashboard() {
         </article>
 
         <article className="panel event-panel">
-          <PanelHeading eyebrow="EVENTS" title="Warnings and logs" detail={logError ?? "Newest first"} />
-          {events.length ? <ol className="event-list">{events.map((event) => (
-            <li key={event.key}><time>{new Date(event.at).toLocaleTimeString([], { hour12: false })}</time><span className={`event-mark ${event.priority <= 4 ? "warn" : "info"}`} /><p><b>{event.source}</b>{event.text}</p></li>
-          ))}</ol> : <div className="empty-state"><TerminalSquare size={18} /><span>{bridgeError || logError ? "Service logs unavailable" : logsLoaded ? "No recent warnings or logs" : "Waiting for service logs"}</span></div>}
+          <PanelHeading eyebrow="EVENTS" title="Warnings and logs" detail={logError ? "Log feed unavailable" : `${events.length} loaded`} />
+          <div className="event-controls" aria-label="Event filters">
+            <label className="event-search"><span>Search</span><input type="search" value={eventQuery} onChange={(event) => { setEventQuery(event.target.value); setEventPage(1); }} placeholder="Message or service" /></label>
+            <label><span>Severity</span><select value={eventLevelFilter} onChange={(event) => { setEventLevelFilter(event.target.value as EventLevel); setEventPage(1); }}><option value="all">All</option><option value="error">Errors</option><option value="warning">Warnings</option><option value="info">Info</option></select></label>
+            <label><span>Service</span><select value={eventSourceFilter} onChange={(event) => { setEventSourceFilter(event.target.value); setEventPage(1); }}><option value="all">All services</option>{eventSources.map((source) => <option value={source} key={source}>{source}</option>)}</select></label>
+            <label><span>Order</span><select value={eventOrder} onChange={(event) => { setEventOrder(event.target.value as EventOrder); setEventPage(1); }}><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></label>
+            {filtersActive ? <button className="clear-filters" type="button" onClick={() => { setEventLevelFilter("all"); setEventSourceFilter("all"); setEventQuery(""); setEventPage(1); }}>Clear filters</button> : null}
+          </div>
+          {pagedEvents.length ? <ol className="event-list">{pagedEvents.map((event) => (
+            <li key={event.key}><time>{eventTimeLabel(event.at)}</time><span className={`event-level ${eventLevel(event.priority)}`}>{eventLevel(event.priority)}</span><p><b>{event.source}</b>{event.text}</p></li>
+          ))}</ol> : <div className="empty-state event-empty"><TerminalSquare size={18} /><span>{filtersActive ? "No events match the current filters" : bridgeError || logError ? "Service logs unavailable" : logsLoaded ? "No recent warnings or logs" : "Waiting for service logs"}</span></div>}
+          <div className="event-pagination" aria-label="Event pages">
+            <span>{filteredEvents.length ? `${pageStart + 1}–${Math.min(pageStart + EVENT_PAGE_SIZE, filteredEvents.length)} of ${filteredEvents.length}` : "0 events"}</span>
+            <div><button type="button" onClick={() => setEventPage(Math.max(1, currentEventPage - 1))} disabled={currentEventPage === 1}>Previous</button><span>Page {currentEventPage} of {eventPageCount}</span><button type="button" onClick={() => setEventPage(Math.min(eventPageCount, currentEventPage + 1))} disabled={currentEventPage === eventPageCount}>Next</button></div>
+          </div>
         </article>
 
         <article className="panel payload-panel">
-          <PanelHeading eyebrow="PAYLOAD" title="Synchronization" detail={recordError ?? (recordsLoaded ? `updated ${ageLabel(secondaryUpdatedAt, now)}` : "Connecting")} />
-          <div className="payload-stats"><div><strong>{status?.payload.accepted ?? "—"}</strong><span>Accepted events</span></div><div><strong>{status?.payload.rejected ?? "—"}</strong><span>Rejected events</span></div><div><strong>{ageLabel(latestManifest, now)}</strong><span>Latest manifest</span></div></div>
+          <PanelHeading eyebrow="PAYLOAD" title="Synchronization" detail={recordError ? "Record feed unavailable" : undefined} />
+          <div className="payload-stats"><div><strong>{status?.payload.accepted ?? "—"}</strong><span>Accepted events</span></div><div><strong>{status?.payload.rejected ?? "—"}</strong><span>Rejected events</span></div><div><strong>{recordsLoaded ? timestampLabel(latestManifest) : "—"}</strong><span>Latest manifest</span></div></div>
           <div className="record-line"><ImageIcon size={15} /><span>{recordsLoaded ? bulkRecords.length : "—"} recent manifests</span><span>{recordsLoaded ? ackRecords.length : "—"} recent acknowledgements</span></div>
           <p className="panel-note">Metadata only. Image bytes and absolute imagery paths are never shown.</p>
         </article>
@@ -328,7 +417,7 @@ export function Dashboard() {
 }
 
 function Metric({ title, value, state, detail, icon }: { title: string; value: string; state: "good" | "warn"; detail: string; icon: React.ReactNode }) {
-  return <article className="metric-card"><div className="metric-title">{icon}<p>{title}</p></div><div className="metric-line"><strong>{value}</strong><span className={`metric-state ${state}`}>{state === "good" ? "Fresh" : "Attention"}</span></div><small>{detail}</small></article>;
+  return <article className="metric-card"><div className="metric-title">{icon}<p>{title}</p></div><div className="metric-line"><strong>{value}</strong><span className={`metric-state ${state}`}>{state === "good" ? "OK" : "Attention"}</span></div><small>{detail}</small></article>;
 }
 
 function PanelHeading({ eyebrow, title, detail }: { eyebrow: string; title: string; detail?: string }) {
