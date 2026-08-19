@@ -190,7 +190,7 @@ journalctl -u avian-ground-ui.service --since today
 
 | Route | Purpose | Bounds |
 | --- | --- | --- |
-| `GET /api/v1/health` | Bridge health and read-only declaration | Fixed response |
+| `GET /api/v1/health` | Bridge health and operational safety boundary | Fixed response |
 | `GET /api/v1/status` | Fixed, display-only AVIAN status projection | schema v1, 3 s / 1 MiB |
 | `GET /api/v1/aircraft` | Latest validated synchronized flight state per aircraft | telemetry only, 100 records, 3 s / 1 MiB |
 | `GET /api/v1/records?class=bulk&limit=20` | Publication timestamps only | bulk/ack allowlist, 1–100 |

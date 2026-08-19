@@ -1,5 +1,5 @@
 [Unit]
-Description=AVIAN read-only ground dashboard
+Description=AVIAN operational ground dashboard
 Documentation=https://github.com/andrewodom18/avian-ground-ui
 Wants=network-online.target avian-mesh-agent.service
 After=network-online.target avian-mesh-agent.service
