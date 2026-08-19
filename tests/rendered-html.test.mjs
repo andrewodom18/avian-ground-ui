@@ -22,6 +22,10 @@ test("server-renders the AVIAN operations shell", async () => {
   assert.match(html, /<title>AVIAN Ground \| Operations<\/title>/i);
   assert.match(html, /Operations overview/);
   assert.match(html, /Auto refresh 10s/i);
+  assert.match(html, /Synchronized aircraft telemetry/i);
+  assert.match(html, /Mesh refresh 2s/i);
+  assert.match(html, /Waiting for AVIAN mesh telemetry/i);
+  assert.match(html, /Aircraft feed/i);
   assert.match(html, /active warning/i);
   assert.match(html, /Event filters/i);
   assert.match(html, /Message or service/i);
@@ -32,6 +36,7 @@ test("server-renders the AVIAN operations shell", async () => {
   assert.match(html, /Previous/i);
   assert.match(html, /Next/i);
   assert.doesNotMatch(html, /updated never|additional warnings/i);
+  assert.doesNotMatch(html, />MAVLink</i);
   assert.match(html, /observational only/i);
   assert.doesNotMatch(html, /emergency rtl|return to launch/i);
 });

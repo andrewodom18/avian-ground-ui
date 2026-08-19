@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -42,12 +43,14 @@ struct Args {
     assets: PathBuf,
     #[arg(long, default_value = "/usr/bin/journalctl")]
     journalctl: PathBuf,
+    #[arg(long)]
+    disable_journal: bool,
 }
 
 #[derive(Clone)]
 struct AppState {
     avian: AvianClient,
-    journalctl: Arc<PathBuf>,
+    journalctl: Option<Arc<PathBuf>>,
     authority: Arc<str>,
 }
 
@@ -232,6 +235,61 @@ struct DashboardRecord {
     published_at_ms: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct TelemetryRecordInput {
+    record: TelemetryRecordBodyInput,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelemetryRecordBodyInput {
+    source: String,
+    published_at_ms: u64,
+    expires_at_ms: Option<u64>,
+    payload: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct AircraftTelemetryInput {
+    source: String,
+    timestamp_ms: u64,
+    latitude_deg: f64,
+    longitude_deg: f64,
+    altitude: AircraftAltitudeInput,
+    velocity_ned_mps: [f32; 3],
+    attitude_rpy_deg: [f32; 3],
+    battery_remaining: Option<f32>,
+    control_link_quality: Option<f32>,
+    armed: bool,
+    landed: Option<bool>,
+    failsafe: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+struct AircraftAltitudeInput {
+    msl_m: f64,
+    agl_m: Option<f64>,
+    above_launch_m: f64,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct DashboardAircraftTelemetry {
+    source: String,
+    observed_at_ms: u64,
+    synchronized_at_ms: u64,
+    expires_at_ms: Option<u64>,
+    latitude_deg: f64,
+    longitude_deg: f64,
+    position_available: bool,
+    altitude: AircraftAltitudeInput,
+    velocity_ned_mps: [f32; 3],
+    attitude_rpy_deg: [f32; 3],
+    battery_remaining: Option<f32>,
+    control_link_quality: Option<f32>,
+    armed: bool,
+    landed: Option<bool>,
+    failsafe: bool,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -250,7 +308,7 @@ async fn main() -> anyhow::Result<()> {
             socket: Arc::new(args.control_socket),
             max_message_bytes: MAX_CONTROL_BYTES,
         },
-        journalctl: Arc::new(args.journalctl),
+        journalctl: (!args.disable_journal).then(|| Arc::new(args.journalctl)),
         authority: Arc::from(args.bind.to_string()),
     };
     let index = args.assets.join("index.html");
@@ -258,6 +316,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/status", get(agent_status))
+        .route("/api/v1/aircraft", get(aircraft))
         .route("/api/v1/records", get(records))
         .route("/api/v1/logs", get(logs))
         .fallback_service(static_files)
@@ -412,6 +471,34 @@ async fn records(
     Ok(api_json(json!({ "records": records })))
 }
 
+async fn aircraft(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let body = state
+        .avian
+        .request(json!({
+            "type": "list_records",
+            "class": "telemetry",
+            "limit": 100
+        }))
+        .await?;
+    if body.get("type").and_then(Value::as_str) != Some("records") {
+        return Err(control_error(body));
+    }
+    let records = body
+        .get("records")
+        .cloned()
+        .ok_or_else(|| ApiError::unavailable("invalid_control_response", "records are missing"))?;
+    let records: Vec<TelemetryRecordInput> = serde_json::from_value(records).map_err(|_| {
+        ApiError::unavailable(
+            "invalid_control_response",
+            "telemetry record schema is invalid",
+        )
+    })?;
+    Ok(api_json(json!({
+        "aircraft": project_aircraft_records(records),
+        "observed_at_ms": unix_time_ms()
+    })))
+}
+
 fn project_records(records: Vec<RecordInput>, limit: u16) -> Vec<DashboardRecord> {
     records
         .into_iter()
@@ -424,6 +511,71 @@ fn project_records(records: Vec<RecordInput>, limit: u16) -> Vec<DashboardRecord
 
 fn is_allowed_record_class(class: &str) -> bool {
     matches!(class, "acknowledgement" | "bulk")
+}
+
+fn project_aircraft_records(records: Vec<TelemetryRecordInput>) -> Vec<DashboardAircraftTelemetry> {
+    let mut sources = BTreeSet::new();
+    records
+        .into_iter()
+        .filter_map(|view| {
+            let kind = view.record.payload.get("kind")?.as_str()?;
+            if kind != "telemetry" {
+                return None;
+            }
+            let telemetry: AircraftTelemetryInput =
+                serde_json::from_value(view.record.payload.get("value")?.clone()).ok()?;
+            if telemetry.source != view.record.source
+                || !valid_aircraft_telemetry(&telemetry)
+                || !sources.insert(telemetry.source.clone())
+            {
+                return None;
+            }
+            Some(DashboardAircraftTelemetry {
+                source: sanitize_message(&telemetry.source),
+                observed_at_ms: telemetry.timestamp_ms,
+                synchronized_at_ms: view.record.published_at_ms,
+                expires_at_ms: view.record.expires_at_ms,
+                latitude_deg: telemetry.latitude_deg,
+                longitude_deg: telemetry.longitude_deg,
+                // GLOBAL_POSITION_INT can use exact 0,0 as the no-position
+                // sentinel before the flight controller has a usable fix.
+                // Preserve the numeric fields for schema stability, but make
+                // the ambiguity explicit to the operator projection.
+                position_available: telemetry.latitude_deg != 0.0 || telemetry.longitude_deg != 0.0,
+                altitude: telemetry.altitude,
+                velocity_ned_mps: telemetry.velocity_ned_mps,
+                attitude_rpy_deg: telemetry.attitude_rpy_deg,
+                battery_remaining: telemetry.battery_remaining,
+                control_link_quality: telemetry.control_link_quality,
+                armed: telemetry.armed,
+                landed: telemetry.landed,
+                failsafe: telemetry.failsafe,
+            })
+        })
+        .collect()
+}
+
+fn valid_aircraft_telemetry(value: &AircraftTelemetryInput) -> bool {
+    value.source.len() <= 128
+        && !value.source.is_empty()
+        && value.latitude_deg.is_finite()
+        && (-90.0..=90.0).contains(&value.latitude_deg)
+        && value.longitude_deg.is_finite()
+        && (-180.0..=180.0).contains(&value.longitude_deg)
+        && value.altitude.msl_m.is_finite()
+        && value
+            .altitude
+            .agl_m
+            .is_none_or(|altitude| altitude.is_finite() && altitude >= 0.0)
+        && value.altitude.above_launch_m.is_finite()
+        && value.velocity_ned_mps.iter().all(|item| item.is_finite())
+        && value.attitude_rpy_deg.iter().all(|item| item.is_finite())
+        && value
+            .battery_remaining
+            .is_none_or(|item| item.is_finite() && (0.0..=1.0).contains(&item))
+        && value
+            .control_link_quality
+            .is_none_or(|item| item.is_finite() && (0.0..=1.0).contains(&item))
 }
 
 fn project_status(input: StatusInput) -> Result<DashboardStatus, ApiError> {
@@ -485,8 +637,11 @@ async fn logs(
             "log lines must be 1-{MAX_LOG_LINES}"
         )));
     }
-    let entries = read_journal(&state.journalctl, query.lines).await?;
-    Ok(api_json(json!({ "entries": entries })))
+    let Some(journalctl) = state.journalctl.as_deref() else {
+        return Ok(api_json(json!({ "available": false, "entries": [] })));
+    };
+    let entries = read_journal(journalctl, query.lines).await?;
+    Ok(api_json(json!({ "available": true, "entries": entries })))
 }
 
 fn api_json(value: Value) -> Response {
@@ -821,6 +976,137 @@ mod tests {
         ] {
             assert!(!is_allowed_record_class(class));
         }
+    }
+
+    #[test]
+    fn aircraft_projection_keeps_latest_valid_snapshot_per_source() {
+        let records: Vec<TelemetryRecordInput> = serde_json::from_value(json!([
+            {
+                "record_id": "telemetry/mel-stardog",
+                "record": {
+                    "source": "mel-stardog",
+                    "published_at_ms": 2_000,
+                    "expires_at_ms": 4_000,
+                    "payload": {
+                        "kind": "telemetry",
+                        "value": {
+                            "source": "mel-stardog",
+                            "timestamp_ms": 1_950,
+                            "latitude_deg": 27.9506,
+                            "longitude_deg": -82.4572,
+                            "altitude": {"msl_m": 120.0, "agl_m": 42.0, "above_launch_m": 40.0},
+                            "velocity_ned_mps": [10.0, 2.0, -1.0],
+                            "attitude_rpy_deg": [1.0, 2.0, 90.0],
+                            "battery_remaining": 0.75,
+                            "control_link_quality": 0.8,
+                            "armed": true,
+                            "landed": false,
+                            "failsafe": false
+                        }
+                    }
+                }
+            },
+            {
+                "record_id": "telemetry/mel-stardog-old",
+                "record": {
+                    "source": "mel-stardog",
+                    "published_at_ms": 1_000,
+                    "expires_at_ms": 3_000,
+                    "payload": {
+                        "kind": "telemetry",
+                        "value": {
+                            "source": "mel-stardog",
+                            "timestamp_ms": 950,
+                            "latitude_deg": 0.0,
+                            "longitude_deg": 0.0,
+                            "altitude": {"msl_m": 1.0, "agl_m": null, "above_launch_m": 0.0},
+                            "velocity_ned_mps": [0.0, 0.0, 0.0],
+                            "attitude_rpy_deg": [0.0, 0.0, 0.0],
+                            "battery_remaining": null,
+                            "control_link_quality": null,
+                            "armed": false,
+                            "landed": true,
+                            "failsafe": false
+                        }
+                    }
+                }
+            }
+        ]))
+        .unwrap();
+        let projected = project_aircraft_records(records);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].source, "mel-stardog");
+        assert_eq!(projected[0].observed_at_ms, 1_950);
+        assert_eq!(projected[0].synchronized_at_ms, 2_000);
+        assert!(projected[0].position_available);
+        assert_eq!(projected[0].battery_remaining, Some(0.75));
+        assert!(projected[0].armed);
+    }
+
+    #[test]
+    fn aircraft_projection_marks_zero_position_unavailable() {
+        let records: Vec<TelemetryRecordInput> = serde_json::from_value(json!([{
+            "record": {
+                "source": "mel-stardog",
+                "published_at_ms": 2_000,
+                "expires_at_ms": 4_000,
+                "payload": {
+                    "kind": "telemetry",
+                    "value": {
+                        "source": "mel-stardog",
+                        "timestamp_ms": 1_950,
+                        "latitude_deg": 0.0,
+                        "longitude_deg": 0.0,
+                        "altitude": {"msl_m": 1.0, "agl_m": null, "above_launch_m": 0.0},
+                        "velocity_ned_mps": [0.0, 0.0, 0.0],
+                        "attitude_rpy_deg": [0.0, 0.0, 0.0],
+                        "battery_remaining": null,
+                        "control_link_quality": null,
+                        "armed": false,
+                        "landed": null,
+                        "failsafe": false
+                    }
+                }
+            }
+        }]))
+        .unwrap();
+
+        let projected = project_aircraft_records(records);
+        assert_eq!(projected.len(), 1);
+        assert!(!projected[0].position_available);
+    }
+
+    #[test]
+    fn aircraft_projection_rejects_mismatched_or_invalid_telemetry() {
+        let record = |source: &str, payload_source: &str, latitude: f64| {
+            serde_json::from_value::<TelemetryRecordInput>(json!({
+                "record": {
+                    "source": source,
+                    "published_at_ms": 2_000,
+                    "expires_at_ms": 4_000,
+                    "payload": {
+                        "kind": "telemetry",
+                        "value": {
+                            "source": payload_source,
+                            "timestamp_ms": 1_950,
+                            "latitude_deg": latitude,
+                            "longitude_deg": -82.0,
+                            "altitude": {"msl_m": 120.0, "agl_m": null, "above_launch_m": 40.0},
+                            "velocity_ned_mps": [0.0, 0.0, 0.0],
+                            "attitude_rpy_deg": [0.0, 0.0, 0.0],
+                            "battery_remaining": null,
+                            "control_link_quality": null,
+                            "armed": false,
+                            "landed": null,
+                            "failsafe": false
+                        }
+                    }
+                }
+            }))
+            .unwrap()
+        };
+        assert!(project_aircraft_records(vec![record("air-a", "air-b", 27.0)]).is_empty());
+        assert!(project_aircraft_records(vec![record("air-a", "air-a", 127.0)]).is_empty());
     }
 
     #[test]

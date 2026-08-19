@@ -3,9 +3,12 @@
 import {
   Activity,
   AlertTriangle,
+  Battery,
   CheckCircle2,
   ChevronDown,
   Image as ImageIcon,
+  MapPin,
+  Plane,
   Radio,
   RefreshCw,
   Satellite,
@@ -52,10 +55,30 @@ type AgentStatus = {
 
 type LogEntry = { timestamp_ms: number; unit: string; priority: number; message: string };
 type RecordView = { published_at_ms: number };
+type AircraftTelemetry = {
+  source: string;
+  observed_at_ms: number;
+  synchronized_at_ms: number;
+  expires_at_ms: number | null;
+  latitude_deg: number;
+  longitude_deg: number;
+  position_available: boolean;
+  altitude: { msl_m: number; agl_m: number | null; above_launch_m: number };
+  velocity_ned_mps: [number, number, number];
+  attitude_rpy_deg: [number, number, number];
+  battery_remaining: number | null;
+  control_link_quality: number | null;
+  armed: boolean;
+  landed: boolean | null;
+  failsafe: boolean;
+};
 type EventItem = { key: string; at: number; priority: number; source: string; text: string };
 type EventLevel = "all" | "warning" | "error" | "info";
 type EventOrder = "newest" | "oldest";
+type MetricState = "good" | "warn" | "stale";
 
+const AIRCRAFT_POLL_INTERVAL_MS = 2_000;
+const AIRCRAFT_FRESH_MS = 5_000;
 const STATUS_POLL_INTERVAL_MS = 10_000;
 const SECONDARY_POLL_INTERVAL_MS = 30_000;
 const EVENT_PAGE_SIZE = 8;
@@ -94,13 +117,13 @@ function decodeStatusResponse(value: unknown): { status: AgentStatus } {
   return { status: value.status };
 }
 
-function decodeLogResponse(value: unknown): { entries: LogEntry[] } {
+function decodeLogResponse(value: unknown): { available: boolean; entries: LogEntry[] } {
   if (!isObject(value) || !Array.isArray(value.entries) || !value.entries.every((entry) => isObject(entry)
     && typeof entry.timestamp_ms === "number" && typeof entry.unit === "string"
     && typeof entry.priority === "number" && typeof entry.message === "string")) {
     throw new Error("Ground bridge returned an invalid log response");
   }
-  return { entries: value.entries as LogEntry[] };
+  return { available: typeof value.available === "boolean" ? value.available : true, entries: value.entries as LogEntry[] };
 }
 
 function decodeRecordResponse(value: unknown): { records: RecordView[] } {
@@ -109,6 +132,31 @@ function decodeRecordResponse(value: unknown): { records: RecordView[] } {
     throw new Error("Ground bridge returned an invalid record response");
   }
   return { records: value.records as RecordView[] };
+}
+
+function isAircraftTelemetry(value: unknown): value is AircraftTelemetry {
+  return isObject(value) && typeof value.source === "string"
+    && typeof value.observed_at_ms === "number" && typeof value.synchronized_at_ms === "number"
+    && isNumberOrNull(value.expires_at_ms) && typeof value.latitude_deg === "number"
+    && typeof value.longitude_deg === "number" && typeof value.position_available === "boolean"
+    && isObject(value.altitude)
+    && typeof value.altitude.msl_m === "number" && isNumberOrNull(value.altitude.agl_m)
+    && typeof value.altitude.above_launch_m === "number"
+    && Array.isArray(value.velocity_ned_mps) && value.velocity_ned_mps.length === 3
+    && value.velocity_ned_mps.every((item) => typeof item === "number" && Number.isFinite(item))
+    && Array.isArray(value.attitude_rpy_deg) && value.attitude_rpy_deg.length === 3
+    && value.attitude_rpy_deg.every((item) => typeof item === "number" && Number.isFinite(item))
+    && isNumberOrNull(value.battery_remaining) && isNumberOrNull(value.control_link_quality)
+    && typeof value.armed === "boolean" && (value.landed === null || typeof value.landed === "boolean")
+    && typeof value.failsafe === "boolean";
+}
+
+function decodeAircraftResponse(value: unknown): { aircraft: AircraftTelemetry[]; observed_at_ms: number } {
+  if (!isObject(value) || typeof value.observed_at_ms !== "number" || !Array.isArray(value.aircraft)
+    || !value.aircraft.every(isAircraftTelemetry)) {
+    throw new Error("Ground bridge returned an invalid aircraft response");
+  }
+  return { aircraft: value.aircraft, observed_at_ms: value.observed_at_ms };
 }
 
 async function fetchJson<T>(path: string, decode: (value: unknown) => T): Promise<T> {
@@ -166,6 +214,32 @@ function eventTimeLabel(timestamp: number): string {
   });
 }
 
+function clockLabel(timestamp: number | null): string {
+  if (!timestamp) return "never";
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+function feetLabel(metres: number | null): string {
+  return metres == null ? "—" : `${Math.round(metres * 3.28084).toLocaleString()} ft`;
+}
+
+function percentLabel(value: number | null): string {
+  return value == null ? "—" : `${Math.round(value * 100)}%`;
+}
+
+function groundSpeedKnots(velocity: [number, number, number]): string {
+  return `${(Math.hypot(velocity[0], velocity[1]) * 1.94384).toFixed(1)} kt`;
+}
+
+function headingLabel(yaw: number): string {
+  return `${Math.round(((yaw % 360) + 360) % 360)}°`;
+}
+
 function eventLevel(priority: number): Exclude<EventLevel, "all"> {
   if (priority <= 3) return "error";
   if (priority === 4) return "warning";
@@ -174,14 +248,20 @@ function eventLevel(priority: number): Exclude<EventLevel, "all"> {
 
 export function Dashboard() {
   const [status, setStatus] = useState<AgentStatus | null>(null);
+  const [aircraft, setAircraft] = useState<AircraftTelemetry[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [bulkRecords, setBulkRecords] = useState<RecordView[]>([]);
   const [ackRecords, setAckRecords] = useState<RecordView[]>([]);
   const [bridgeError, setBridgeError] = useState<string | null>(null);
+  const [aircraftError, setAircraftError] = useState<string | null>(null);
   const [logError, setLogError] = useState<string | null>(null);
   const [recordError, setRecordError] = useState<string | null>(null);
   const [logsLoaded, setLogsLoaded] = useState(false);
+  const [logAvailable, setLogAvailable] = useState(true);
+  const [aircraftLoaded, setAircraftLoaded] = useState(false);
   const [recordsLoaded, setRecordsLoaded] = useState(false);
+  const [lastStatusAt, setLastStatusAt] = useState<number | null>(null);
+  const [aircraftPollAt, setAircraftPollAt] = useState<number | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [eventLevelFilter, setEventLevelFilter] = useState<EventLevel>("all");
   const [eventSourceFilter, setEventSourceFilter] = useState("all");
@@ -189,6 +269,7 @@ export function Dashboard() {
   const [eventOrder, setEventOrder] = useState<EventOrder>("newest");
   const [eventPage, setEventPage] = useState(1);
   const statusInFlight = useRef(false);
+  const aircraftInFlight = useRef(false);
   const secondaryInFlight = useRef(false);
 
   const loadStatus = useCallback(async () => {
@@ -197,12 +278,28 @@ export function Dashboard() {
     try {
       const response = await fetchJson("/api/v1/status", decodeStatusResponse);
       setStatus(response.status);
+      setLastStatusAt(Date.now());
       setBridgeError(null);
     } catch (error) {
-      setStatus(null);
       setBridgeError(fetchErrorLabel(error, "AVIAN status"));
     } finally {
       statusInFlight.current = false;
+    }
+  }, []);
+
+  const loadAircraft = useCallback(async () => {
+    if (aircraftInFlight.current) return;
+    aircraftInFlight.current = true;
+    try {
+      const response = await fetchJson("/api/v1/aircraft", decodeAircraftResponse);
+      setAircraft(response.aircraft);
+      setAircraftLoaded(true);
+      setAircraftError(null);
+    } catch (error) {
+      setAircraftError(fetchErrorLabel(error, "Aircraft telemetry"));
+    } finally {
+      setAircraftPollAt(Date.now());
+      aircraftInFlight.current = false;
     }
   }, []);
 
@@ -218,21 +315,17 @@ export function Dashboard() {
       if (results[0].status === "fulfilled") {
         setLogs(results[0].value.entries);
         setLogsLoaded(true);
+        setLogAvailable(results[0].value.available);
         setLogError(null);
       } else {
-        setLogs([]);
-        setLogsLoaded(false);
         setLogError(fetchErrorLabel(results[0].reason, "Service logs"));
       }
       if (results[1].status === "fulfilled") setBulkRecords(results[1].value.records);
-      else setBulkRecords([]);
       if (results[2].status === "fulfilled") setAckRecords(results[2].value.records);
-      else setAckRecords([]);
       if (results[1].status === "fulfilled" && results[2].status === "fulfilled") {
         setRecordsLoaded(true);
         setRecordError(null);
       } else {
-        setRecordsLoaded(false);
         const failures = [
           results[1].status === "rejected" ? fetchErrorLabel(results[1].reason, "Payload manifests") : null,
           results[2].status === "rejected" ? fetchErrorLabel(results[2].reason, "Payload acknowledgements") : null,
@@ -246,15 +339,18 @@ export function Dashboard() {
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([loadStatus(), loadSecondary()]);
+    await Promise.all([loadStatus(), loadAircraft(), loadSecondary()]);
     setRefreshing(false);
-  }, [loadSecondary, loadStatus]);
+  }, [loadAircraft, loadSecondary, loadStatus]);
 
   useEffect(() => {
     const initialTimer = window.setTimeout(() => void refresh(), 0);
     const statusTimer = window.setInterval(() => {
       if (!document.hidden) void loadStatus();
     }, STATUS_POLL_INTERVAL_MS);
+    const aircraftTimer = window.setInterval(() => {
+      if (!document.hidden) void loadAircraft();
+    }, AIRCRAFT_POLL_INTERVAL_MS);
     const secondaryTimer = window.setInterval(() => {
       if (!document.hidden) void loadSecondary();
     }, SECONDARY_POLL_INTERVAL_MS);
@@ -265,25 +361,36 @@ export function Dashboard() {
     return () => {
       window.clearTimeout(initialTimer);
       window.clearInterval(statusTimer);
+      window.clearInterval(aircraftTimer);
       window.clearInterval(secondaryTimer);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [loadSecondary, loadStatus, refresh]);
+  }, [loadAircraft, loadSecondary, loadStatus, refresh]);
 
   const disconnected = status?.peers.filter((peer) => !peer.connected) ?? [];
   const connected = (status?.peers.length ?? 0) - disconnected.length;
+  const { liveAircraft, staleAircraft } = useMemo(() => {
+    const fresh = (item: AircraftTelemetry) => !aircraftError && aircraftPollAt != null
+      && Math.max(0, aircraftPollAt - item.observed_at_ms) <= AIRCRAFT_FRESH_MS;
+    return { liveAircraft: aircraft.filter(fresh), staleAircraft: aircraft.filter((item) => !fresh(item)) };
+  }, [aircraft, aircraftError, aircraftPollAt]);
   const warnings = useMemo(() => {
     const values: string[] = [];
     if (!status && !bridgeError) values.push("Waiting for the first live AVIAN status snapshot");
     if (bridgeError) values.push(bridgeError);
+    if (aircraftError) values.push(aircraftError);
     if (logError) values.push(logError);
     if (recordError) values.push(recordError);
     if (status && !status.ready) values.push("Agent acceptance requirements are not fully met");
     if (disconnected.length) values.push(`${disconnected.length} configured peer${disconnected.length === 1 ? " is" : "s are"} unavailable`);
     if (status?.mavlink.required && !status.mavlink.connected) values.push("Required MAVLink connection is unavailable");
     if (status?.radio.required && !status.radio.fresh) values.push("Required radio observation is stale or unhealthy");
+    if (aircraftLoaded && aircraft.length === 0) values.push("No aircraft telemetry has synchronized through the AVIAN mesh");
+    for (const item of staleAircraft) values.push(`${item.source} telemetry is stale; showing the last synchronized snapshot`);
+    for (const item of aircraft.filter((value) => !value.position_available)) values.push(`${item.source} position is unavailable; verify GPS/EKF before flight`);
+    for (const item of aircraft.filter((value) => value.failsafe)) values.push(`${item.source} reports an active flight-controller failsafe`);
     return values;
-  }, [bridgeError, disconnected.length, logError, recordError, status]);
+  }, [aircraft, aircraftError, aircraftLoaded, bridgeError, disconnected.length, logError, recordError, staleAircraft, status]);
 
   const events = useMemo<EventItem[]>(() => [
     ...(status?.last_errors ?? []).map((error) => ({
@@ -320,6 +427,9 @@ export function Dashboard() {
   const filtersActive = eventLevelFilter !== "all" || eventSourceFilter !== "all" || eventQuery !== "";
 
   const latestManifest = bulkRecords[0]?.published_at_ms ?? null;
+  const localMetricState: MetricState = bridgeError && status ? "stale" : status?.ready ? "good" : "warn";
+  const aircraftMetricState: MetricState = liveAircraft.length > 0 && staleAircraft.length === 0 ? "good"
+    : aircraft.length > 0 ? "stale" : "warn";
 
   return (
     <main className="shell">
@@ -331,8 +441,8 @@ export function Dashboard() {
         <div className="header-actions">
           <div className={`sync-state ${bridgeError ? "offline" : !status ? "connecting" : ""}`} role="status">
             {bridgeError ? <WifiOff size={15} /> : status ? <CheckCircle2 size={15} /> : <RefreshCw size={15} className="spinning" />}
-            {bridgeError ? "Bridge offline" : status ? `Live · ${status.node.name}` : "Connecting to local bridge"}
-            <span className="sync-time">Auto refresh 10s</span>
+            {bridgeError ? (status ? "Local bridge interrupted" : "Local bridge offline") : status ? `Live · ${status.node.name}` : "Connecting to local bridge"}
+            <span className="sync-time">{bridgeError && lastStatusAt ? `Last live ${clockLabel(lastStatusAt)}` : status && lastStatusAt ? `Snapshot ${clockLabel(lastStatusAt)}` : "Auto refresh 10s"}</span>
           </div>
           <button className="refresh-button" type="button" onClick={() => void refresh()} disabled={refreshing}>
             <RefreshCw size={14} className={refreshing ? "spinning" : ""} /> Refresh now
@@ -356,13 +466,41 @@ export function Dashboard() {
       )}
 
       <section className="metric-grid" aria-label="Mission health summary">
-        <Metric title="Agent readiness" value={status ? (status.ready ? "Ready" : "Degraded") : "Unavailable"} state={status?.ready ? "good" : "warn"} detail={status ? `Uptime ${durationLabel(status.node.uptime_ms)}` : "Waiting for local bridge"} icon={<ShieldCheck size={17} />} />
-        <Metric title="Connected peers" value={status ? `${connected} / ${status.peers.length}` : "—"} state={status && !disconnected.length ? "good" : "warn"} detail={!status ? "Waiting for live peer status" : disconnected.length ? `${disconnected.length} reconnect in progress` : "All configured peers connected"} icon={<Activity size={17} />} />
-        <Metric title="MAVLink" value={!status ? "—" : !status.mavlink.required ? "Optional" : status.mavlink.connected ? "Locked" : "Offline"} state={status && (status.mavlink.connected || !status.mavlink.required) ? "good" : "warn"} detail={!status ? "Waiting for live MAVLink status" : status.mavlink.target_system_id != null ? `System ${status.mavlink.target_system_id}` : "No current system lock"} icon={<Radio size={17} />} />
-        <Metric title="Radio monitor" value={!status ? "—" : !status.radio.required ? "Optional" : status.radio.fresh ? "Healthy" : "Degraded"} state={status && (status.radio.fresh || !status.radio.required) ? "good" : "warn"} detail={!status ? "Waiting for live radio status" : !status.radio.required ? "Monitoring disabled" : status.radio.fresh ? "Observation current" : "Required observation unavailable"} icon={<Satellite size={17} />} />
+        <Metric title="Ground agent" value={status ? (status.ready ? "Ready" : "Degraded") : "Unavailable"} state={localMetricState} detail={status ? `Uptime ${durationLabel(status.node.uptime_ms)}` : "Waiting for local bridge"} icon={<ShieldCheck size={17} />} />
+        <Metric title="Connected peers" value={status ? `${connected} / ${status.peers.length}` : "—"} state={bridgeError && status ? "stale" : status && !disconnected.length ? "good" : "warn"} detail={!status ? "Waiting for live peer status" : disconnected.length ? `${disconnected.length} reconnect in progress` : "All configured peers connected"} icon={<Activity size={17} />} />
+        <Metric title="Aircraft feed" value={aircraftLoaded ? `${liveAircraft.length} live` : "Waiting"} state={aircraftMetricState} detail={staleAircraft.length ? `${staleAircraft.length} last-known snapshot${staleAircraft.length === 1 ? "" : "s"}` : liveAircraft.length ? "Mesh telemetry current" : "No synchronized aircraft yet"} icon={<Plane size={17} />} />
+        <Metric title="Radio monitor" value={!status ? "—" : !status.radio.required ? "Optional" : status.radio.fresh ? "Healthy" : "Degraded"} state={bridgeError && status ? "stale" : status && (status.radio.fresh || !status.radio.required) ? "good" : "warn"} detail={!status ? "Waiting for live radio status" : !status.radio.required ? "Passive underlay monitoring" : status.radio.fresh ? "Observation current" : "Required observation unavailable"} icon={<Satellite size={17} />} />
       </section>
 
       <section className="content-grid">
+        <article className="panel aircraft-panel">
+          <PanelHeading eyebrow="FLIGHT" title="Synchronized aircraft telemetry" detail="Mesh refresh 2s" />
+          {aircraft.length ? <div className="aircraft-grid">{aircraft.map((item) => {
+            const fresh = liveAircraft.some((value) => value.source === item.source);
+            return <section className={`aircraft-card ${fresh ? "live" : "stale"} ${item.failsafe ? "failsafe" : ""}`} key={item.source}>
+              <div className="aircraft-title"><div><Plane size={18} /><strong>{item.source}</strong></div><span>{fresh ? "Live" : "Last known"}</span></div>
+              <div className="flight-primary">
+                <div><small>Altitude MSL</small><strong>{feetLabel(item.altitude.msl_m)}</strong></div>
+                <div><small>{item.altitude.agl_m == null ? "Above launch" : "Altitude AGL"}</small><strong>{feetLabel(item.altitude.agl_m ?? item.altitude.above_launch_m)}</strong></div>
+                <div><small>Ground speed</small><strong>{groundSpeedKnots(item.velocity_ned_mps)}</strong></div>
+                <div><small>Heading</small><strong>{headingLabel(item.attitude_rpy_deg[2])}</strong></div>
+              </div>
+              <div className="flight-secondary">
+                <span><Battery size={14} /> Battery <b>{percentLabel(item.battery_remaining)}</b></span>
+                <span><Radio size={14} /> Control link <b>{percentLabel(item.control_link_quality)}</b></span>
+                <span className={item.position_available ? "" : "attention"}><MapPin size={14} /> {item.position_available ? `${item.latitude_deg.toFixed(5)}, ${item.longitude_deg.toFixed(5)}` : "Position unavailable"}</span>
+              </div>
+              <div className="flight-flags">
+                <span className={item.armed ? "attention" : ""}>{item.armed ? "Armed" : "Disarmed"}</span>
+                <span>{item.landed == null ? "Landed state unknown" : item.landed ? "Landed" : "Airborne"}</span>
+                <span className={item.failsafe ? "danger" : ""}>{item.failsafe ? "Failsafe active" : "No failsafe"}</span>
+                <time>{fresh ? "Observed" : "Last observed"} {clockLabel(item.observed_at_ms)}</time>
+              </div>
+            </section>;
+          })}</div> : <div className="empty-state aircraft-empty"><Plane size={19} /><span>{aircraftError ? "Aircraft feed unavailable" : aircraftLoaded ? "No aircraft telemetry has synchronized yet" : "Waiting for AVIAN mesh telemetry"}</span></div>}
+          <p className="panel-note">Telemetry is read from the local ground agent. If an aircraft link drops, the last synchronized snapshot remains visible and is marked stale.</p>
+        </article>
+
         <article className="panel peer-panel">
           <PanelHeading eyebrow="MESH" title="Peers and active paths" detail="Read only" />
           <div className="peer-table" role="table" aria-label="Peer status">
@@ -386,7 +524,7 @@ export function Dashboard() {
         </article>
 
         <article className="panel event-panel">
-          <PanelHeading eyebrow="EVENTS" title="Warnings and logs" detail={logError ? "Log feed unavailable" : `${events.length} loaded`} />
+          <PanelHeading eyebrow="EVENTS" title="Warnings and logs" detail={logError ? "Showing last available feed" : !logAvailable ? "Local journal disabled" : `${events.length} loaded`} />
           <div className="event-controls" aria-label="Event filters">
             <label className="event-search"><span>Search</span><input type="search" value={eventQuery} onChange={(event) => { setEventQuery(event.target.value); setEventPage(1); }} placeholder="Message or service" /></label>
             <label><span>Severity</span><select value={eventLevelFilter} onChange={(event) => { setEventLevelFilter(event.target.value as EventLevel); setEventPage(1); }}><option value="all">All</option><option value="error">Errors</option><option value="warning">Warnings</option><option value="info">Info</option></select></label>
@@ -396,7 +534,7 @@ export function Dashboard() {
           </div>
           {pagedEvents.length ? <ol className="event-list">{pagedEvents.map((event) => (
             <li key={event.key}><time>{eventTimeLabel(event.at)}</time><span className={`event-level ${eventLevel(event.priority)}`}>{eventLevel(event.priority)}</span><p><b>{event.source}</b>{event.text}</p></li>
-          ))}</ol> : <div className="empty-state event-empty"><TerminalSquare size={18} /><span>{filtersActive ? "No events match the current filters" : bridgeError || logError ? "Service logs unavailable" : logsLoaded ? "No recent warnings or logs" : "Waiting for service logs"}</span></div>}
+          ))}</ol> : <div className="empty-state event-empty"><TerminalSquare size={18} /><span>{filtersActive ? "No events match the current filters" : logError ? "Service logs unavailable" : logsLoaded ? "No recent warnings or logs" : "Waiting for service logs"}</span></div>}
           <div className="event-pagination" aria-label="Event pages">
             <span>{filteredEvents.length ? `${pageStart + 1}–${Math.min(pageStart + EVENT_PAGE_SIZE, filteredEvents.length)} of ${filteredEvents.length}` : "0 events"}</span>
             <div><button type="button" onClick={() => setEventPage(Math.max(1, currentEventPage - 1))} disabled={currentEventPage === 1}>Previous</button><span>Page {currentEventPage} of {eventPageCount}</span><button type="button" onClick={() => setEventPage(Math.min(eventPageCount, currentEventPage + 1))} disabled={currentEventPage === eventPageCount}>Next</button></div>
@@ -405,8 +543,8 @@ export function Dashboard() {
 
         <article className="panel payload-panel">
           <PanelHeading eyebrow="PAYLOAD" title="Synchronization" detail={recordError ? "Record feed unavailable" : undefined} />
-          <div className="payload-stats"><div><strong>{status?.payload.accepted ?? "—"}</strong><span>Accepted events</span></div><div><strong>{status?.payload.rejected ?? "—"}</strong><span>Rejected events</span></div><div><strong>{recordsLoaded ? timestampLabel(latestManifest) : "—"}</strong><span>Latest manifest</span></div></div>
-          <div className="record-line"><ImageIcon size={15} /><span>{recordsLoaded ? bulkRecords.length : "—"} recent manifests</span><span>{recordsLoaded ? ackRecords.length : "—"} recent acknowledgements</span></div>
+          <div className="payload-stats"><div><strong>{recordsLoaded ? bulkRecords.length : "—"}</strong><span>Recent manifests</span></div><div><strong>{recordsLoaded ? ackRecords.length : "—"}</strong><span>Recent acknowledgements</span></div><div><strong>{recordsLoaded ? timestampLabel(latestManifest) : "—"}</strong><span>Latest manifest</span></div></div>
+          <div className="record-line"><ImageIcon size={15} /><span>Replicated AVIAN metadata</span><span>No image bytes</span></div>
           <p className="panel-note">Metadata only. Image bytes and absolute imagery paths are never shown.</p>
         </article>
       </section>
@@ -416,8 +554,8 @@ export function Dashboard() {
   );
 }
 
-function Metric({ title, value, state, detail, icon }: { title: string; value: string; state: "good" | "warn"; detail: string; icon: React.ReactNode }) {
-  return <article className="metric-card"><div className="metric-title">{icon}<p>{title}</p></div><div className="metric-line"><strong>{value}</strong><span className={`metric-state ${state}`}>{state === "good" ? "OK" : "Attention"}</span></div><small>{detail}</small></article>;
+function Metric({ title, value, state, detail, icon }: { title: string; value: string; state: MetricState; detail: string; icon: React.ReactNode }) {
+  return <article className="metric-card"><div className="metric-title">{icon}<p>{title}</p></div><div className="metric-line"><strong>{value}</strong><span className={`metric-state ${state}`}>{state === "good" ? "OK" : state === "stale" ? "Stale" : "Attention"}</span></div><small>{detail}</small></article>;
 }
 
 function PanelHeading({ eyebrow, title, detail }: { eyebrow: string; title: string; detail?: string }) {
