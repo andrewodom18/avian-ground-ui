@@ -1,12 +1,15 @@
 # AVIAN Ground UI
 
 A lightweight, read-only field dashboard for AVIAN ground devices. It surfaces
-live agent readiness, mesh peers, selected underlays, MAVLink freshness, radio
-health, payload synchronization, warnings, and bounded sanitized service logs.
-Status refreshes every 10 seconds, while the heavier log and record feeds
-refresh every 30 seconds; background tabs pause polling and manual refresh is
-always available. Active warnings expand in place, and the bounded 200-entry
-event view supports search, severity/service filters, ordering, and pagination.
+local agent readiness, mesh peers, selected underlays, synchronized aircraft
+telemetry, radio health, payload synchronization, warnings, and bounded
+sanitized service logs. Aircraft telemetry refreshes every 2 seconds, status
+every 10 seconds, and the heavier log and record feeds every 30 seconds;
+background tabs pause polling and manual refresh is always available. The last
+good aircraft sample remains visible and is explicitly marked stale when a
+link is interrupted. Active warnings expand in place, and the bounded
+200-entry event view supports search, severity/service filters, ordering, and
+pagination.
 
 ![AVIAN ground network preview](public/avian-ground-preview.png)
 
@@ -18,12 +21,17 @@ event view supports search, severity/service filters, ordering, and pagination.
   rebinding and cross-origin reads of the local service.
 - The API contains only health, status, record-listing, and fixed AVIAN journal
   queries. There is no emergency-command or mutation route.
-- Status is parsed and projected into a fixed display schema. Peer addresses,
-  endpoint identifiers, command state, raw radio-device details, and source
-  error strings never cross the browser boundary.
-- Only bulk and acknowledgement records can be queried. Responses contain only
-  publication timestamps; record IDs, sources, payloads, paths, and image bytes
-  are discarded by the bridge.
+- Status and aircraft telemetry are parsed and projected into fixed display
+  schemas. The aircraft projection contains only flight state needed by the
+  operator: source, observation time, position and its availability, altitude, velocity, attitude,
+  battery/control-link state, armed/landed state, and failsafe state. Peer
+  addresses, endpoint identifiers, command state, raw radio-device details,
+  and source error strings never cross the browser boundary.
+- The generic record endpoint permits only bulk and acknowledgement records.
+  Responses contain only publication timestamps; record IDs, sources,
+  payloads, paths, and image bytes are discarded by the bridge. The dedicated
+  aircraft endpoint issues a fixed telemetry query and returns only the latest
+  validated projection per aircraft source.
 - AVIAN control messages, responses, journal bytes, log lines, record limits,
   concurrent browser fetches, and timeouts are bounded.
 - The journal command is invoked directly with fixed units and arguments; no
@@ -46,9 +54,14 @@ Browser on ground device
         │ HTTP 127.0.0.1:4178 (read only)
         ▼
 avian-ground-ui (Rust)
-        ├── /run/avian/control.sock  status + record listing only
-        ├── journalctl               fixed AVIAN units, bounded + sanitized
+        ├── local ground-agent socket  status + synchronized records only
+        ├── journalctl                 optional, fixed AVIAN units + sanitized
         └── ground-dist/             exported React dashboard
+                 ▲
+                 │ PEAT records over the selected AVIAN underlay
+                 │ (direct Ethernet/Silvus, then ZeroTier-over-satellite)
+                 │
+           aircraft mesh-agent ── Cube MAVLink
 ```
 
 The Sites/vinext project under `app/` produces both the development preview and
@@ -85,7 +98,26 @@ npm run export:ground
 cargo run --locked -- --assets ground-dist --control-socket /run/avian/control.sock
 ```
 
+On macOS, where systemd's journal is not present, add `--disable-journal` and
+point `--control-socket` at the local ground agent's Unix socket.
+
 Open [http://127.0.0.1:4178/](http://127.0.0.1:4178/).
+
+## Flight operation
+
+Run both `mesh-agent` and this service on the operator device. The browser then
+talks only to loopback, while aircraft data reaches the local agent as
+synchronized AVIAN telemetry records. Do not point the browser directly at an
+aircraft web server and do not depend on an SSH tunnel to the aircraft during
+flight.
+
+Configure at least two ordered peer addresses when available: the preferred
+local RF/Ethernet address and a ZeroTier address carried by the satellite
+underlay. AVIAN reconnects through the next reachable address. During an
+interruption the page stays available, preserves the last good sample, labels
+it `Last known`, and raises a stale-data warning; it resumes `Live` after fresh
+records arrive. A transport transition is break-before-make in the current
+milestone, so a short telemetry gap is expected.
 
 ## Remote operator access
 
@@ -96,11 +128,12 @@ separate operator laptop:
 ssh -N -L 4178:127.0.0.1:4178 operator@ground-device
 ```
 
-Then open [http://127.0.0.1:4178/](http://127.0.0.1:4178/) on the laptop. The
+Then open [http://127.0.0.1:4178/](http://127.0.0.1:4178/) on the laptop. This
+is appropriate only when AVIAN Ground runs on a separate ground computer. The
 dashboard and AVIAN services continue running if the laptop link is removed,
-but an SSH tunnel cannot migrate between Ethernet, Wi-Fi, and overlay paths;
-reconnect it through a currently reachable device address. The UI is not a
-ground-device network dependency and its loss does not stop mesh operation.
+but an SSH tunnel cannot migrate between Ethernet, Wi-Fi, and overlay paths.
+For flight, prefer running the Ground service on the same operator Mac as the
+browser so no SSH session is in the critical display path.
 
 `jq` is not required. Operators may install it for interactive shell filtering,
 but the service, installer, checks, and runbooks rely only on their declared
@@ -132,6 +165,7 @@ journalctl -u avian-ground-ui.service --since today
 | --- | --- | --- |
 | `GET /api/v1/health` | Bridge health and read-only declaration | Fixed response |
 | `GET /api/v1/status` | Fixed, display-only AVIAN status projection | schema v1, 3 s / 1 MiB |
+| `GET /api/v1/aircraft` | Latest validated synchronized flight state per aircraft | telemetry only, 100 records, 3 s / 1 MiB |
 | `GET /api/v1/records?class=bulk&limit=20` | Publication timestamps only | bulk/ack allowlist, 1–100 |
 | `GET /api/v1/logs?lines=80` | AVIAN mesh/link service journal | fixed units, 1–200 lines / 1 MiB |
 
