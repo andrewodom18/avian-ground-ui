@@ -104,6 +104,12 @@ struct ConnectRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SetPathsRequest {
+    paths: Vec<ConnectionAddress>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConnectionCode {
     schema_version: u16,
     formation_id: String,
@@ -118,11 +124,17 @@ struct ConnectionAircraft {
     addresses: Vec<ConnectionAddress>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ConnectionAddress {
     underlay: String,
     address: SocketAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SavedConnection {
+    name: String,
+    paths: Vec<ConnectionAddress>,
 }
 
 impl IntoResponse for ApiError {
@@ -370,6 +382,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/connections/{name}",
             delete(remove_aircraft),
         )
+        .route(
+            "/api/v1/connections/{name}/paths",
+            axum::routing::put(set_aircraft_paths),
+        )
         .fallback_service(static_files)
         .layer(DefaultBodyLimit::max(MAX_SETUP_BODY_BYTES))
         .layer(ConcurrencyLimitLayer::new(64))
@@ -471,20 +487,21 @@ async fn health() -> impl IntoResponse {
         "read_only": true,
         "operations_read_only": true,
         "connection_setup": true,
-        "connection_removal": true
+        "connection_removal": true,
+        "path_management": true
     }))
 }
 
 async fn list_connections(State(state): State<AppState>) -> Result<Response, ApiError> {
     let body = state
         .avian
-        .request(json!({ "type": "list_paired_peers" }))
+        .request(json!({ "type": "list_paired_peer_details" }))
         .await?;
-    if body.get("type").and_then(Value::as_str) != Some("paired_peers") {
+    if body.get("type").and_then(Value::as_str) != Some("paired_peer_details") {
         return Err(control_error(body));
     }
-    let names = decode_paired_peer_names(&body)?;
-    Ok(api_json(json!({ "connections": names })))
+    let connections = decode_paired_peer_details(&body)?;
+    Ok(api_json(json!({ "connections": connections })))
 }
 
 async fn connect_aircraft(
@@ -576,6 +593,77 @@ async fn remove_aircraft(
     Ok(api_json(json!({ "name": removed_name, "removed": true })))
 }
 
+async fn set_aircraft_paths(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<SetPathsRequest>,
+) -> Result<Response, ApiError> {
+    require_setup_confirmation(&headers)?;
+    if !valid_setup_identifier(&name) {
+        return Err(ApiError::bad_request("aircraft name is invalid"));
+    }
+    validate_connection_addresses(&request.paths, true)?;
+    let body = state
+        .avian
+        .request(json!({
+            "type": "set_peer_paths",
+            "name": name,
+            "addresses": request.paths
+        }))
+        .await?;
+    if body.get("type").and_then(Value::as_str) == Some("error") {
+        let detail = body
+            .get("detail")
+            .and_then(Value::as_str)
+            .map(sanitize_message)
+            .unwrap_or_else(|| "aircraft path change was rejected".to_owned());
+        return Err(ApiError::bad_request(detail));
+    }
+    if body.get("type").and_then(Value::as_str) != Some("peer_paths_configured") {
+        return Err(control_error(body));
+    }
+    let configured_name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| valid_setup_identifier(value) && *value == name)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ApiError::unavailable(
+                "invalid_control_response",
+                "configured peer name is missing or mismatched",
+            )
+        })?;
+    let paths: Vec<ConnectionAddress> =
+        serde_json::from_value(body.get("addresses").cloned().ok_or_else(|| {
+            ApiError::unavailable(
+                "invalid_control_response",
+                "configured peer paths are missing",
+            )
+        })?)
+        .map_err(|_| {
+            ApiError::unavailable(
+                "invalid_control_response",
+                "configured peer paths are invalid",
+            )
+        })?;
+    validate_control_addresses(&paths, true)?;
+    let connected = body
+        .get("connected")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            ApiError::unavailable(
+                "invalid_control_response",
+                "configured peer connection state is missing",
+            )
+        })?;
+    Ok(api_json(json!({
+        "name": configured_name,
+        "paths": paths,
+        "connected": connected
+    })))
+}
+
 fn require_setup_confirmation(headers: &HeaderMap) -> Result<(), ApiError> {
     if headers
         .get("x-avian-setup")
@@ -588,24 +676,25 @@ fn require_setup_confirmation(headers: &HeaderMap) -> Result<(), ApiError> {
     }
 }
 
-fn decode_paired_peer_names(body: &Value) -> Result<Vec<String>, ApiError> {
-    let names = body.get("names").and_then(Value::as_array).ok_or_else(|| {
+fn decode_paired_peer_details(body: &Value) -> Result<Vec<SavedConnection>, ApiError> {
+    let peers = body.get("peers").and_then(Value::as_array).ok_or_else(|| {
         ApiError::unavailable(
             "invalid_control_response",
             "paired aircraft list is missing",
         )
     })?;
-    if names.len() > 1_000 {
+    if peers.len() > 1_000 {
         return Err(ApiError::unavailable(
             "invalid_control_response",
             "paired aircraft list exceeds the local limit",
         ));
     }
-    let mut decoded = names
+    let mut decoded = peers
         .iter()
         .map(|value| {
-            value
-                .as_str()
+            let name = value
+                .get("name")
+                .and_then(Value::as_str)
                 .filter(|name| valid_setup_identifier(name))
                 .map(str::to_owned)
                 .ok_or_else(|| {
@@ -613,12 +702,79 @@ fn decode_paired_peer_names(body: &Value) -> Result<Vec<String>, ApiError> {
                         "invalid_control_response",
                         "paired aircraft list contains an invalid name",
                     )
-                })
+                })?;
+            let paths: Vec<ConnectionAddress> =
+                serde_json::from_value(value.get("addresses").cloned().ok_or_else(|| {
+                    ApiError::unavailable(
+                        "invalid_control_response",
+                        "paired aircraft paths are missing",
+                    )
+                })?)
+                .map_err(|_| {
+                    ApiError::unavailable(
+                        "invalid_control_response",
+                        "paired aircraft paths are invalid",
+                    )
+                })?;
+            validate_control_addresses(&paths, true)?;
+            Ok(SavedConnection { name, paths })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    decoded.sort();
-    decoded.dedup();
+    decoded.sort_by(|left, right| left.name.cmp(&right.name));
+    if decoded
+        .windows(2)
+        .any(|window| window[0].name == window[1].name)
+    {
+        return Err(ApiError::unavailable(
+            "invalid_control_response",
+            "paired aircraft list contains duplicate names",
+        ));
+    }
     Ok(decoded)
+}
+
+fn validate_connection_addresses(
+    addresses: &[ConnectionAddress],
+    allow_empty: bool,
+) -> Result<(), ApiError> {
+    if (!allow_empty && addresses.is_empty()) || addresses.len() > 8 {
+        return Err(ApiError::bad_request(if allow_empty {
+            "an aircraft supports at most 8 paths"
+        } else {
+            "an aircraft connection must contain 1-8 paths"
+        }));
+    }
+    let mut unique = BTreeSet::new();
+    for address in addresses {
+        if !matches!(
+            address.underlay.as_str(),
+            "silvus" | "ethernet" | "wifi" | "satellite" | "other"
+        ) || address.address.port() == 0
+            || !valid_connection_ip(address.address.ip())
+        {
+            return Err(ApiError::bad_request("aircraft path is invalid"));
+        }
+        let canonical =
+            SocketAddr::new(address.address.ip().to_canonical(), address.address.port());
+        if !unique.insert(canonical) {
+            return Err(ApiError::bad_request(
+                "aircraft paths must use unique network addresses",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_control_addresses(
+    addresses: &[ConnectionAddress],
+    allow_empty: bool,
+) -> Result<(), ApiError> {
+    validate_connection_addresses(addresses, allow_empty).map_err(|_| {
+        ApiError::unavailable(
+            "invalid_control_response",
+            "paired aircraft list contains invalid paths",
+        )
+    })
 }
 
 fn decode_connection_code(value: &str) -> Result<ConnectionCode, ApiError> {
@@ -662,23 +818,9 @@ fn decode_connection_code(value: &str) -> Result<ConnectionCode, ApiError> {
             "connection code contains an invalid aircraft identity",
         ));
     }
-    if connection.aircraft.addresses.is_empty() || connection.aircraft.addresses.len() > 8 {
-        return Err(ApiError::bad_request(
-            "connection code must contain 1-8 aircraft addresses",
-        ));
-    }
-    for address in &connection.aircraft.addresses {
-        if !matches!(
-            address.underlay.as_str(),
-            "silvus" | "ethernet" | "wifi" | "satellite" | "other"
-        ) || address.address.port() == 0
-            || !valid_connection_ip(address.address.ip())
-        {
-            return Err(ApiError::bad_request(
-                "connection code contains an invalid aircraft address",
-            ));
-        }
-    }
+    validate_connection_addresses(&connection.aircraft.addresses, false).map_err(|_| {
+        ApiError::bad_request("connection code contains invalid or duplicate aircraft paths")
+    })?;
     Ok(connection)
 }
 
@@ -1599,24 +1741,83 @@ mod tests {
     }
 
     #[test]
-    fn paired_aircraft_list_is_validated_sorted_and_deduplicated() {
+    fn paired_aircraft_details_are_validated_and_sorted() {
         let body = json!({
-            "type": "paired_peers",
-            "names": ["aircraft-002", "aircraft-001", "aircraft-002"]
+            "type": "paired_peer_details",
+            "peers": [
+                {"name": "aircraft-002", "addresses": []},
+                {"name": "aircraft-001", "addresses": [
+                    {"underlay": "ethernet", "address": "192.0.2.4:9000"}
+                ]}
+            ]
         });
         assert_eq!(
-            decode_paired_peer_names(&body).unwrap(),
-            vec!["aircraft-001", "aircraft-002"]
+            decode_paired_peer_details(&body).unwrap(),
+            vec![
+                SavedConnection {
+                    name: "aircraft-001".into(),
+                    paths: vec![ConnectionAddress {
+                        underlay: "ethernet".into(),
+                        address: "192.0.2.4:9000".parse().unwrap()
+                    }]
+                },
+                SavedConnection {
+                    name: "aircraft-002".into(),
+                    paths: vec![]
+                }
+            ]
         );
-        assert!(decode_paired_peer_names(&json!({
-            "type": "paired_peers",
-            "names": ["../aircraft"]
+        assert!(decode_paired_peer_details(&json!({
+            "type": "paired_peer_details",
+            "peers": [{"name": "../aircraft", "addresses": []}]
         }))
         .is_err());
-        assert!(decode_paired_peer_names(&json!({
-            "type": "paired_peers",
-            "names": vec!["aircraft"; 1_001]
+        assert!(decode_paired_peer_details(&json!({
+            "type": "paired_peer_details",
+            "peers": vec![json!({"name": "aircraft", "addresses": []}); 1_001]
         }))
+        .is_err());
+        assert!(decode_paired_peer_details(&json!({
+            "type": "paired_peer_details",
+            "peers": [
+                {"name": "aircraft", "addresses": []},
+                {"name": "aircraft", "addresses": []}
+            ]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn path_mutations_accept_zero_paths_but_reject_duplicates_and_bad_endpoints() {
+        assert!(validate_connection_addresses(&[], true).is_ok());
+        assert!(validate_connection_addresses(&[], false).is_err());
+        let path = ConnectionAddress {
+            underlay: "satellite".into(),
+            address: "10.210.122.229:9000".parse().unwrap(),
+        };
+        assert!(validate_connection_addresses(std::slice::from_ref(&path), true).is_ok());
+        assert!(validate_connection_addresses(&[path.clone(), path], true).is_err());
+        assert!(validate_connection_addresses(
+            &[
+                ConnectionAddress {
+                    underlay: "ethernet".into(),
+                    address: "192.0.2.4:9000".parse().unwrap()
+                },
+                ConnectionAddress {
+                    underlay: "wifi".into(),
+                    address: "[::ffff:192.0.2.4]:9000".parse().unwrap()
+                }
+            ],
+            true
+        )
+        .is_err());
+        assert!(validate_connection_addresses(
+            &[ConnectionAddress {
+                underlay: "wifi".into(),
+                address: "127.0.0.1:9000".parse().unwrap()
+            }],
+            true
+        )
         .is_err());
     }
 
@@ -1750,6 +1951,54 @@ mod tests {
         let response = remove_aircraft(State(state), AxumPath("aircraft-001".to_owned()), headers)
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn path_handler_replaces_the_complete_path_set() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            let request: Value = serde_json::from_slice(&request).unwrap();
+            assert_eq!(request["protocol_version"], 1);
+            assert_eq!(request["body"]["type"], "set_peer_paths");
+            assert_eq!(request["body"]["name"], "aircraft-001");
+            assert_eq!(request["body"]["addresses"][0]["underlay"], "satellite");
+            stream
+                .write_all(
+                    br#"{"protocol_version":1,"body":{"type":"peer_paths_configured","name":"aircraft-001","addresses":[{"underlay":"satellite","address":"10.210.122.229:9000"}],"connected":false}}"#,
+                )
+                .await
+                .unwrap();
+        });
+        let state = AppState {
+            avian: AvianClient {
+                socket: Arc::new(socket),
+                max_message_bytes: 4_096,
+            },
+            journalctl: None,
+            authority: Arc::from("127.0.0.1:4178"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-avian-setup", HeaderValue::from_static("1"));
+        let response = set_aircraft_paths(
+            State(state),
+            AxumPath("aircraft-001".to_owned()),
+            headers,
+            Json(SetPathsRequest {
+                paths: vec![ConnectionAddress {
+                    underlay: "satellite".into(),
+                    address: "10.210.122.229:9000".parse().unwrap(),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         server.await.unwrap();
     }

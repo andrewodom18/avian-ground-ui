@@ -10,6 +10,7 @@ import {
   Link2,
   MapPin,
   Plane,
+  Plus,
   Radio,
   RefreshCw,
   Satellite,
@@ -81,12 +82,17 @@ type EventOrder = "newest" | "oldest";
 type MetricState = "good" | "warn" | "stale";
 type ConnectionResult = { name: string; connected: boolean };
 type RemovalResult = { name: string; removed: true };
+type ConnectionPath = { underlay: string; address: string };
+type SavedConnection = { name: string; paths: ConnectionPath[] };
+type PathUpdateResult = { name: string; paths: ConnectionPath[]; connected: boolean };
+type PathDraft = { underlay: string; address: string };
 
 const AIRCRAFT_POLL_INTERVAL_MS = 2_000;
 const AIRCRAFT_FRESH_MS = 5_000;
 const STATUS_POLL_INTERVAL_MS = 10_000;
 const SECONDARY_POLL_INTERVAL_MS = 30_000;
 const EVENT_PAGE_SIZE = 8;
+const UNDERLAY_OPTIONS = ["silvus", "ethernet", "wifi", "satellite", "other"] as const;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -189,11 +195,29 @@ function decodeConnectionResponse(value: unknown): ConnectionResult {
   return { name: value.name, connected: value.connected };
 }
 
-function decodeConnectionListResponse(value: unknown): { connections: string[] } {
-  if (!isObject(value) || !Array.isArray(value.connections) || !value.connections.every((name) => typeof name === "string")) {
+function isConnectionPath(value: unknown): value is ConnectionPath {
+  return isObject(value) && UNDERLAY_OPTIONS.includes(value.underlay as typeof UNDERLAY_OPTIONS[number])
+    && typeof value.address === "string" && value.address.length > 0;
+}
+
+function isSavedConnection(value: unknown): value is SavedConnection {
+  return isObject(value) && typeof value.name === "string" && Array.isArray(value.paths)
+    && value.paths.length <= 8 && value.paths.every(isConnectionPath);
+}
+
+function decodeConnectionListResponse(value: unknown): { connections: SavedConnection[] } {
+  if (!isObject(value) || !Array.isArray(value.connections) || !value.connections.every(isSavedConnection)) {
     throw new Error("Ground bridge returned an invalid saved-aircraft response");
   }
   return { connections: value.connections };
+}
+
+function decodePathUpdateResponse(value: unknown): PathUpdateResult {
+  if (!isObject(value) || typeof value.name !== "string" || typeof value.connected !== "boolean"
+    || !Array.isArray(value.paths) || value.paths.length > 8 || !value.paths.every(isConnectionPath)) {
+    throw new Error("Ground bridge returned an invalid path update response");
+  }
+  return { name: value.name, paths: value.paths, connected: value.connected };
 }
 
 function decodeRemovalResponse(value: unknown): RemovalResult {
@@ -301,12 +325,16 @@ export function Dashboard() {
   const [connectionPending, setConnectionPending] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [connectionResult, setConnectionResult] = useState<ConnectionResult | null>(null);
-  const [savedConnections, setSavedConnections] = useState<string[]>([]);
+  const [savedConnections, setSavedConnections] = useState<SavedConnection[]>([]);
   const [connectionsLoaded, setConnectionsLoaded] = useState(false);
   const [connectionListError, setConnectionListError] = useState<string | null>(null);
   const [removeConfirmName, setRemoveConfirmName] = useState<string | null>(null);
   const [removalPending, setRemovalPending] = useState<string | null>(null);
   const [removalResult, setRemovalResult] = useState<RemovalResult | null>(null);
+  const [pathDrafts, setPathDrafts] = useState<Record<string, PathDraft>>({});
+  const [pathPending, setPathPending] = useState<string | null>(null);
+  const [pathConfirmKey, setPathConfirmKey] = useState<string | null>(null);
+  const [pathResult, setPathResult] = useState<PathUpdateResult | null>(null);
   const statusInFlight = useRef(false);
   const aircraftInFlight = useRef(false);
   const secondaryInFlight = useRef(false);
@@ -319,6 +347,8 @@ export function Dashboard() {
     setConnectionResult(null);
     setRemovalResult(null);
     setRemoveConfirmName(null);
+    setPathConfirmKey(null);
+    setPathResult(null);
     setConnectionOpen(true);
   }, []);
 
@@ -476,7 +506,7 @@ export function Dashboard() {
       dataVisibilityRevision.current += 1;
       setRemovalResult(result);
       setRemoveConfirmName(null);
-      setSavedConnections((current) => current.filter((value) => value !== result.name));
+      setSavedConnections((current) => current.filter((value) => value.name !== result.name));
       setStatus((current) => current ? {
         ...current,
         peers: current.peers.filter((peer) => peer.name !== result.name),
@@ -495,6 +525,58 @@ export function Dashboard() {
     }
   }, [loadAircraft, loadConnections, loadSecondary, loadStatus]);
 
+  const replacePaths = useCallback(async (connection: SavedConnection, paths: ConnectionPath[]) => {
+    setPathPending(connection.name);
+    setConnectionError(null);
+    setConnectionResult(null);
+    setRemovalResult(null);
+    setPathResult(null);
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 8_000);
+    try {
+      const response = await fetch(`/api/v1/connections/${encodeURIComponent(connection.name)}/paths`, {
+        method: "PUT",
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json", "x-avian-setup": "1" },
+        body: JSON.stringify({ paths }),
+        signal: controller.signal,
+      });
+      const payload: unknown = await response.json().catch(() => null);
+      if (!response.ok) {
+        const detail = isObject(payload) && typeof payload.detail === "string" ? payload.detail : `HTTP ${response.status}`;
+        throw new Error(detail);
+      }
+      const result = decodePathUpdateResponse(payload);
+      setSavedConnections((current) => current.map((item) => item.name === result.name
+        ? { name: result.name, paths: result.paths }
+        : item));
+      setPathResult(result);
+      setPathConfirmKey(null);
+      await Promise.all([loadStatus(), loadAircraft()]);
+    } catch (error) {
+      setConnectionError(fetchErrorLabel(error, "Aircraft path update"));
+    } finally {
+      window.clearTimeout(timer);
+      setPathPending(null);
+    }
+  }, [loadAircraft, loadStatus]);
+
+  const addPath = useCallback((connection: SavedConnection) => {
+    const draft = pathDrafts[connection.name] ?? { underlay: "ethernet", address: "" };
+    const address = draft.address.trim();
+    if (!address) {
+      setConnectionError("Enter the aircraft IP address and AVIAN port, for example 10.20.30.40:9000");
+      return;
+    }
+    if (connection.paths.some((path) => path.address === address)) {
+      setConnectionError(`${address} is already configured for ${connection.name}`);
+      return;
+    }
+    void replacePaths(connection, [...connection.paths, { underlay: draft.underlay, address }]);
+    setPathDrafts((current) => ({ ...current, [connection.name]: { ...draft, address: "" } }));
+  }, [pathDrafts, replacePaths]);
+
   useEffect(() => {
     if (!connectionOpen) return;
     const timer = window.setTimeout(() => void loadConnections(), 0);
@@ -505,11 +587,11 @@ export function Dashboard() {
   useEffect(() => {
     if (!connectionOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !connectionPending && removalPending === null) setConnectionOpen(false);
+      if (event.key === "Escape" && !connectionPending && removalPending === null && pathPending === null) setConnectionOpen(false);
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [connectionOpen, connectionPending, removalPending]);
+  }, [connectionOpen, connectionPending, pathPending, removalPending]);
 
   useEffect(() => {
     const initialTimer = window.setTimeout(() => void refresh(), 0);
@@ -539,9 +621,10 @@ export function Dashboard() {
   const connected = (status?.peers.length ?? 0) - disconnected.length;
   const { liveAircraft, staleAircraft } = useMemo(() => {
     const fresh = (item: AircraftTelemetry) => !aircraftError && aircraftPollAt != null
+      && status?.peers.some((peer) => peer.name === item.source && peer.connected) === true
       && Math.max(0, aircraftPollAt - item.observed_at_ms) <= AIRCRAFT_FRESH_MS;
     return { liveAircraft: aircraft.filter(fresh), staleAircraft: aircraft.filter((item) => !fresh(item)) };
-  }, [aircraft, aircraftError, aircraftPollAt]);
+  }, [aircraft, aircraftError, aircraftPollAt, status?.peers]);
   const warnings = useMemo(() => {
     const values: string[] = [];
     if (!status && !bridgeError) values.push("Waiting for the first live AVIAN status snapshot");
@@ -601,7 +684,7 @@ export function Dashboard() {
   const localMetricState: MetricState = bridgeError && status ? "stale" : status?.ready ? "good" : "warn";
   const aircraftMetricState: MetricState = liveAircraft.length > 0 && staleAircraft.length === 0 ? "good"
     : aircraft.length > 0 ? "stale" : "warn";
-  const setupPending = connectionPending || removalPending !== null;
+  const setupPending = connectionPending || removalPending !== null || pathPending !== null;
 
   return (
     <main className="shell">
@@ -640,15 +723,39 @@ export function Dashboard() {
               {connectionError ? <p className="connection-message error" role="alert"><AlertTriangle size={15} />{connectionError}</p> : null}
               {displayedConnectionResult ? <p className={`connection-message ${displayedConnectionResult.connected ? "success" : "pending"}`} role="status">{displayedConnectionResult.connected ? <CheckCircle2 size={15} /> : <RefreshCw size={15} className="spinning" />}{displayedConnectionResult.connected ? `${displayedConnectionResult.name} is connected` : `${displayedConnectionResult.name} was saved; AVIAN is attempting the first connection`}</p> : null}
               {removalResult ? <p className="connection-message success" role="status"><CheckCircle2 size={15} />{removalResult.name} was removed; its overview data is hidden</p> : null}
+              {pathResult ? <p className={`connection-message ${pathResult.paths.length === 0 ? "warning" : pathResult.connected ? "success" : "pending"}`} role="status">{pathResult.paths.length === 0 ? <AlertTriangle size={15} /> : pathResult.connected ? <CheckCircle2 size={15} /> : <RefreshCw size={15} className="spinning" />}{pathResult.paths.length === 0 ? `${pathResult.name} has no configured communication paths` : pathResult.connected ? `${pathResult.name} paths saved and connected` : `${pathResult.name} paths saved; AVIAN is reconnecting automatically`}</p> : null}
               <section className="saved-connections" aria-labelledby="saved-connections-title">
-                <div className="saved-connections-heading"><div><strong id="saved-connections-title">Saved aircraft</strong><small>Code-added direct peers on this ground device</small></div><button type="button" onClick={() => void loadConnections()} disabled={setupPending}><RefreshCw size={13} /> Refresh</button></div>
-                {connectionListError ? <p className="saved-connections-error" role="alert"><AlertTriangle size={14} />{connectionListError}</p> : savedConnections.length ? <ul>{savedConnections.map((name) => {
-                  const connectedPeer = status?.peers.find((peer) => peer.name === name);
-                  const confirming = removeConfirmName === name;
-                  const removing = removalPending === name;
-                  return <li key={name}><span><strong>{name}</strong><small>{connectedPeer?.connected ? "Connected" : "Saved locally"}</small></span><div>{confirming ? <><button type="button" className="cancel-removal" onClick={() => setRemoveConfirmName(null)} disabled={removing}>Cancel</button><button type="button" className="confirm-removal" onClick={() => void removeAircraft(name)} disabled={removing}>{removing ? <RefreshCw size={13} className="spinning" /> : <Trash2 size={13} />}{removing ? "Removing…" : "Confirm remove"}</button></> : <button type="button" className="remove-connection" onClick={() => { setRemoveConfirmName(name); setConnectionError(null); setRemovalResult(null); }} disabled={setupPending}><Trash2 size={13} /> Remove</button>}</div></li>;
+                <div className="saved-connections-heading"><div><strong id="saved-connections-title">Saved aircraft and paths</strong><small>AVIAN automatically tries every configured route</small></div><button type="button" onClick={() => void loadConnections()} disabled={setupPending}><RefreshCw size={13} /> Refresh</button></div>
+                {connectionListError ? <p className="saved-connections-error" role="alert"><AlertTriangle size={14} />{connectionListError}</p> : savedConnections.length ? <ul>{savedConnections.map((connection) => {
+                  const connectedPeer = status?.peers.find((peer) => peer.name === connection.name);
+                  const confirming = removeConfirmName === connection.name;
+                  const removing = removalPending === connection.name;
+                  const changingPaths = pathPending === connection.name;
+                  const draft = pathDrafts[connection.name] ?? { underlay: "ethernet", address: "" };
+                  return <li className="saved-connection-card" key={connection.name}>
+                    <div className="saved-aircraft-row">
+                      <span><strong>{connection.name}</strong><small>{connectedPeer?.connected ? `Connected${connectedPeer.selected_underlay ? ` via ${connectedPeer.selected_underlay}` : ""}` : connection.paths.length ? "Disconnected · retrying" : "Disconnected · no paths"}</small></span>
+                      <div>{confirming ? <><button type="button" className="cancel-removal" onClick={() => setRemoveConfirmName(null)} disabled={removing}>Cancel</button><button type="button" className="confirm-removal" onClick={() => void removeAircraft(connection.name)} disabled={removing}>{removing ? <RefreshCw size={13} className="spinning" /> : <Trash2 size={13} />}{removing ? "Removing…" : "Confirm aircraft removal"}</button></> : <button type="button" className="remove-connection" onClick={() => { setRemoveConfirmName(connection.name); setConnectionError(null); setRemovalResult(null); setPathResult(null); }} disabled={setupPending}><Trash2 size={13} /> Remove aircraft</button>}</div>
+                    </div>
+                    <div className="connection-paths" aria-label={`${connection.name} communication paths`}>
+                      {connection.paths.length ? connection.paths.map((path, index) => {
+                        const key = `${connection.name}-${path.address}`;
+                        const confirmingPath = pathConfirmKey === key;
+                        const isActiveUnderlay = connectedPeer?.connected && connectedPeer.selected_underlay === path.underlay;
+                        return <div className="connection-path-row" key={key}>
+                          <span className="connection-path-copy"><b>{path.underlay}</b><code>{path.address}</code>{isActiveUnderlay ? <small>Active underlay</small> : null}</span>
+                          <span className="connection-path-actions">{confirmingPath ? <><button type="button" onClick={() => setPathConfirmKey(null)} disabled={changingPaths}>Cancel</button><button type="button" className="confirm-removal" onClick={() => void replacePaths(connection, connection.paths.filter((_, pathIndex) => pathIndex !== index))} disabled={changingPaths}>{changingPaths ? <RefreshCw size={12} className="spinning" /> : <Trash2 size={12} />}Confirm</button></> : <button type="button" aria-label={`Remove ${path.underlay} path ${path.address}`} onClick={() => { setPathConfirmKey(key); setConnectionError(null); setPathResult(null); }} disabled={setupPending}><Trash2 size={12} /> Remove path</button>}</span>
+                        </div>;
+                      }) : <p className="no-paths-warning"><AlertTriangle size={14} />No paths configured. Telemetry remains visible as last known while this link-loss simulation is active.</p>}
+                    </div>
+                    <div className="add-path-row">
+                      <label><span>Method</span><select value={draft.underlay} onChange={(event) => setPathDrafts((current) => ({ ...current, [connection.name]: { ...draft, underlay: event.target.value } }))} disabled={setupPending}>{UNDERLAY_OPTIONS.map((underlay) => <option value={underlay} key={underlay}>{underlay}</option>)}</select></label>
+                      <label className="path-address-field"><span>Aircraft address and port</span><input type="text" value={draft.address} onChange={(event) => setPathDrafts((current) => ({ ...current, [connection.name]: { ...draft, address: event.target.value } }))} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addPath(connection); } }} placeholder="10.20.30.40:9000" spellCheck={false} autoCapitalize="none" autoCorrect="off" disabled={setupPending || connection.paths.length >= 8} /></label>
+                      <button type="button" className="add-path-button" onClick={() => addPath(connection)} disabled={setupPending || !draft.address.trim() || connection.paths.length >= 8}><Plus size={13} /> Add path</button>
+                    </div>
+                  </li>;
                 })}</ul> : <p className="saved-connections-empty">{connectionsLoaded ? "No connection-code aircraft are saved." : "Loading saved aircraft…"}</p>}
-                <p className="saved-connections-note">Removal deletes the saved direct peer, stops outbound retries, and hides that aircraft&apos;s synchronized data from this overview. It does not erase local records or revoke formation access. Paste its code again to restore the view.</p>
+                <p className="saved-connections-note"><strong>Test mode:</strong> remove paths to simulate lost communication methods, then add them back to simulate recovery. These controls change only AVIAN&apos;s saved routes; they never disable this computer&apos;s Wi-Fi, Ethernet, radio, or overlay interfaces. Removing an aircraft is separate and hides its overview data.</p>
               </section>
             </div>
             <div className="dialog-actions"><button type="button" className="secondary-action" onClick={() => setConnectionOpen(false)} disabled={setupPending}>Close</button><button type="button" className="primary-action" onClick={() => void connectAircraft()} disabled={setupPending || !connectionCode.trim()}>{connectionPending ? <RefreshCw size={14} className="spinning" /> : <Link2 size={14} />}{connectionPending ? "Connecting…" : "Connect aircraft"}</button></div>
@@ -722,13 +829,14 @@ export function Dashboard() {
         </article>
 
         <article className="panel path-panel">
-          <PanelHeading eyebrow="UNDERLAYS" title="Link health" />
+          <PanelHeading eyebrow="UNDERLAYS" title="Link health" detail={status?.node.role === "ground" ? "Auto selected" : undefined} />
           {status && Object.keys(status.underlays).length > 0 ? Object.entries(status.underlays).map(([name, underlay]) => (
             <div className="path-item" key={name}>
               <div><span className={`status-dot ${underlay.reachable ? "good" : "bad"}`} /><strong>{name}</strong></div><span>{underlay.reachable ? "Reachable" : "Unavailable"}</span>
               <dl><div><dt>Latency</dt><dd>{numberLabel(underlay.latency_ms, " ms")}</dd></div><div><dt>Loss</dt><dd>{underlay.loss_ratio == null ? "—" : `${(underlay.loss_ratio * 100).toFixed(1)}%`}</dd></div><div><dt>Stability</dt><dd>{underlay.stability == null ? "—" : `${Math.round(underlay.stability * 100)}%`}</dd></div></dl>
             </div>
           )) : <div className="empty-state"><Satellite size={18} /><span>{status ? "No link observations available" : "Waiting for link observations"}</span></div>}
+          {status?.node.role === "ground" ? <div className="path-management-callout"><span>AVIAN retries saved routes and selects the live transport automatically.</span><button type="button" onClick={openConnection}><Link2 size={13} /> Add or remove paths</button></div> : null}
         </article>
 
         <article className="panel event-panel">

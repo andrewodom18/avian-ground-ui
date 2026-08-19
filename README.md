@@ -106,7 +106,7 @@ point `--control-socket` at the local ground agent's Unix socket.
 
 Open [http://127.0.0.1:4178/](http://127.0.0.1:4178/).
 
-## Connect or remove an aircraft
+## Connect an aircraft and manage paths
 
 The aircraft and ground installation must already have the same protected
 formation credential. The credential is never put in the browser or connection
@@ -130,8 +130,28 @@ sudo avianctl connection-code \
 Connection codes are for simple pre-provisioned ground formations. Managed
 formations continue to use AVIAN membership manifests.
 
+The same panel lists every public communication path added by the code. AVIAN
+orders and retries the complete set automatically and reports the underlay that
+the live PEAT transport actually selected. To simulate a communication-method
+failure, select **Remove path** and **Confirm**. To simulate recovery, select an
+underlay, enter the aircraft's routable `IP:port`, and select **Add path**. The
+update is atomic and takes effect without restarting either service.
+On an unmanaged ground node, removed addresses also form an inbound deny case:
+if the aircraft dials back over a removed route, the agent closes that transport
+so the remote side cannot bypass the test.
+
+Removing the last path is allowed for complete-link-loss testing. The aircraft
+remains paired and visible as disconnected, and its last synchronized telemetry
+remains visible as stale. Adding a path resumes connection attempts
+immediately; pasting the original connection code restores every provisioned
+path. These controls modify only AVIAN's local routing descriptor—they never
+enable, disable, add, remove, or configure an operating-system network or radio
+interface. Ethernet, Wi-Fi, ZeroTier, Starlink, Silvus, or another underlay must
+already be configured and routable on the ground device.
+
 To remove a code-added aircraft from this ground device, open **Manage
-aircraft**, select **Remove** beside its name, then select **Confirm remove**.
+aircraft**, select **Remove aircraft** beside its name, then select **Confirm
+aircraft removal**.
 The local agent atomically removes the saved public descriptor, stops
 outbound reconnection attempts, and closes its currently tracked transport. It
 does not modify the aircraft or revoke formation membership or credentials.
@@ -208,8 +228,9 @@ journalctl -u avian-ground-ui.service --since today
 | `GET /api/v1/aircraft` | Latest validated synchronized flight state per aircraft | telemetry only, 100 records, 3 s / 1 MiB |
 | `GET /api/v1/records?class=bulk&limit=20` | Publication timestamps only | bulk/ack allowlist, 1–100 |
 | `GET /api/v1/logs?lines=80` | AVIAN mesh/link service journal | fixed units, 1–200 lines / 1 MiB |
-| `GET /api/v1/connections` | List removable connection-code aircraft by name | no addresses, identities, or credentials |
+| `GET /api/v1/connections` | List removable connection-code aircraft and editable public paths | loopback/same-origin, no identities or credentials, at most 8 paths each |
 | `POST /api/v1/connections` | Validate and persist one public aircraft descriptor | same-origin + setup header, 16 KiB body, no formation secret |
+| `PUT /api/v1/connections/{name}/paths` | Atomically replace one code-added aircraft's AVIAN paths | same-origin + setup header, 0–8 unique routable endpoints, static/managed peers rejected |
 | `DELETE /api/v1/connections/{name}` | Remove one connection-code aircraft from this ground device | same-origin + setup header, validated name, static/managed peers rejected |
 
 All API responses are non-cacheable and carry restrictive browser security
