@@ -15,6 +15,11 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "AVIAN Ground",
   description: "Read-only AVIAN mesh health and field telemetry.",
+  openGraph: {
+    title: "AVIAN Ground",
+    description: "Read-only AVIAN mesh health and field telemetry.",
+    images: ["/avian-ground-preview.png"],
+  },
   icons: {
     icon: "/favicon.svg",
     shortcut: "/favicon.svg",

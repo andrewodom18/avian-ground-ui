@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { access, readFile, stat } from "node:fs/promises";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 async function render() {
@@ -20,4 +23,14 @@ test("server-renders the AVIAN operations shell", async () => {
   assert.match(html, /Operations overview/);
   assert.match(html, /observational only/i);
   assert.doesNotMatch(html, /emergency rtl|return to launch/i);
+});
+
+test("ground export is self-contained and omits command controls and source paths", async () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const html = await readFile(join(root, "ground-dist", "index.html"), "utf8");
+  assert.ok((await stat(join(root, "ground-dist", "_next"))).isDirectory());
+  await access(join(root, "ground-dist", "build.json"));
+  assert.doesNotMatch(html, /\/Users\/|\/@id\/|\/app\/globals\.css/);
+  assert.doesNotMatch(html, /emergency rtl|return to launch|issue command/i);
+  assert.match(html, /metadata only/i);
 });
