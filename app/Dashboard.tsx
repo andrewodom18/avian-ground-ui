@@ -15,6 +15,7 @@ import {
   Satellite,
   ShieldCheck,
   TerminalSquare,
+  Trash2,
   WifiOff,
   X,
 } from "lucide-react";
@@ -79,6 +80,7 @@ type EventLevel = "all" | "warning" | "error" | "info";
 type EventOrder = "newest" | "oldest";
 type MetricState = "good" | "warn" | "stale";
 type ConnectionResult = { name: string; connected: boolean };
+type RemovalResult = { name: string; removed: true };
 
 const AIRCRAFT_POLL_INTERVAL_MS = 2_000;
 const AIRCRAFT_FRESH_MS = 5_000;
@@ -185,6 +187,20 @@ function decodeConnectionResponse(value: unknown): ConnectionResult {
   return { name: value.name, connected: value.connected };
 }
 
+function decodeConnectionListResponse(value: unknown): { connections: string[] } {
+  if (!isObject(value) || !Array.isArray(value.connections) || !value.connections.every((name) => typeof name === "string")) {
+    throw new Error("Ground bridge returned an invalid saved-aircraft response");
+  }
+  return { connections: value.connections };
+}
+
+function decodeRemovalResponse(value: unknown): RemovalResult {
+  if (!isObject(value) || typeof value.name !== "string" || value.removed !== true) {
+    throw new Error("Ground bridge returned an invalid removal response");
+  }
+  return { name: value.name, removed: true };
+}
+
 function durationLabel(milliseconds: number): string {
   const minutes = Math.floor(milliseconds / 60_000);
   if (minutes < 60) return `${minutes}m`;
@@ -283,6 +299,12 @@ export function Dashboard() {
   const [connectionPending, setConnectionPending] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [connectionResult, setConnectionResult] = useState<ConnectionResult | null>(null);
+  const [savedConnections, setSavedConnections] = useState<string[]>([]);
+  const [connectionsLoaded, setConnectionsLoaded] = useState(false);
+  const [connectionListError, setConnectionListError] = useState<string | null>(null);
+  const [removeConfirmName, setRemoveConfirmName] = useState<string | null>(null);
+  const [removalPending, setRemovalPending] = useState<string | null>(null);
+  const [removalResult, setRemovalResult] = useState<RemovalResult | null>(null);
   const statusInFlight = useRef(false);
   const aircraftInFlight = useRef(false);
   const secondaryInFlight = useRef(false);
@@ -291,6 +313,8 @@ export function Dashboard() {
   const openConnection = useCallback(() => {
     setConnectionError(null);
     setConnectionResult(null);
+    setRemovalResult(null);
+    setRemoveConfirmName(null);
     setConnectionOpen(true);
   }, []);
 
@@ -359,6 +383,18 @@ export function Dashboard() {
     }
   }, []);
 
+  const loadConnections = useCallback(async () => {
+    try {
+      const response = await fetchJson("/api/v1/connections", decodeConnectionListResponse);
+      setSavedConnections(response.connections);
+      setConnectionsLoaded(true);
+      setConnectionListError(null);
+    } catch (error) {
+      setConnectionsLoaded(true);
+      setConnectionListError(fetchErrorLabel(error, "Saved aircraft"));
+    }
+  }, []);
+
   const refresh = useCallback(async () => {
     setRefreshing(true);
     await Promise.all([loadStatus(), loadAircraft(), loadSecondary()]);
@@ -374,6 +410,7 @@ export function Dashboard() {
     setConnectionPending(true);
     setConnectionError(null);
     setConnectionResult(null);
+    setRemovalResult(null);
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), 8_000);
     try {
@@ -393,24 +430,62 @@ export function Dashboard() {
       const result = decodeConnectionResponse(payload);
       setConnectionResult(result);
       setConnectionCode("");
-      await Promise.all([loadStatus(), loadAircraft()]);
+      await Promise.all([loadStatus(), loadAircraft(), loadConnections()]);
     } catch (error) {
       setConnectionError(fetchErrorLabel(error, "Aircraft connection"));
     } finally {
       window.clearTimeout(timer);
       setConnectionPending(false);
     }
-  }, [connectionCode, loadAircraft, loadStatus]);
+  }, [connectionCode, loadAircraft, loadConnections, loadStatus]);
+
+  const removeAircraft = useCallback(async (name: string) => {
+    setRemovalPending(name);
+    setConnectionError(null);
+    setConnectionResult(null);
+    setRemovalResult(null);
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 8_000);
+    try {
+      const response = await fetch(`/api/v1/connections/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "x-avian-setup": "1" },
+        signal: controller.signal,
+      });
+      const payload: unknown = await response.json().catch(() => null);
+      if (!response.ok) {
+        const detail = isObject(payload) && typeof payload.detail === "string" ? payload.detail : `HTTP ${response.status}`;
+        throw new Error(detail);
+      }
+      const result = decodeRemovalResponse(payload);
+      setRemovalResult(result);
+      setRemoveConfirmName(null);
+      await Promise.all([loadStatus(), loadAircraft(), loadConnections()]);
+    } catch (error) {
+      setConnectionError(fetchErrorLabel(error, "Aircraft removal"));
+    } finally {
+      window.clearTimeout(timer);
+      setRemovalPending(null);
+    }
+  }, [loadAircraft, loadConnections, loadStatus]);
 
   useEffect(() => {
     if (!connectionOpen) return;
+    const timer = window.setTimeout(() => void loadConnections(), 0);
     connectionField.current?.focus();
+    return () => window.clearTimeout(timer);
+  }, [connectionOpen, loadConnections]);
+
+  useEffect(() => {
+    if (!connectionOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !connectionPending) setConnectionOpen(false);
+      if (event.key === "Escape" && !connectionPending && removalPending === null) setConnectionOpen(false);
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [connectionOpen, connectionPending]);
+  }, [connectionOpen, connectionPending, removalPending]);
 
   useEffect(() => {
     const initialTimer = window.setTimeout(() => void refresh(), 0);
@@ -502,6 +577,7 @@ export function Dashboard() {
   const localMetricState: MetricState = bridgeError && status ? "stale" : status?.ready ? "good" : "warn";
   const aircraftMetricState: MetricState = liveAircraft.length > 0 && staleAircraft.length === 0 ? "good"
     : aircraft.length > 0 ? "stale" : "warn";
+  const setupPending = connectionPending || removalPending !== null;
 
   return (
     <main className="shell">
@@ -517,7 +593,7 @@ export function Dashboard() {
             <span className="sync-time">{bridgeError && lastStatusAt ? `Last live ${clockLabel(lastStatusAt)}` : status && lastStatusAt ? `Snapshot ${clockLabel(lastStatusAt)}` : "Auto refresh 10s"}</span>
           </div>
           <button className="connect-button" type="button" onClick={openConnection}>
-            <Link2 size={14} /> Connect aircraft
+            <Link2 size={14} /> Manage aircraft
           </button>
           <button className="refresh-button" type="button" onClick={() => void refresh()} disabled={refreshing}>
             <RefreshCw size={14} className={refreshing ? "spinning" : ""} /> Refresh now
@@ -526,21 +602,32 @@ export function Dashboard() {
       </header>
 
       {connectionOpen ? (
-        <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !connectionPending) setConnectionOpen(false); }}>
+        <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !setupPending) setConnectionOpen(false); }}>
           <section className="connection-dialog" role="dialog" aria-modal="true" aria-labelledby="connection-title">
             <div className="dialog-heading">
-              <div><p className="eyebrow">AIRCRAFT SETUP</p><h2 id="connection-title">Connect an aircraft</h2></div>
-              <button type="button" aria-label="Close aircraft setup" onClick={() => setConnectionOpen(false)} disabled={connectionPending}><X size={17} /></button>
+              <div><p className="eyebrow">AIRCRAFT SETUP</p><h2 id="connection-title">Manage aircraft connections</h2></div>
+              <button type="button" aria-label="Close aircraft setup" onClick={() => setConnectionOpen(false)} disabled={setupPending}><X size={17} /></button>
             </div>
             <div className="dialog-body">
               <p>Connect this device to the aircraft network, then paste the <strong>AVIAN1</strong> code supplied with the drone.</p>
               <ol><li>Power on the aircraft computer.</li><li>Join its local or approved overlay network.</li><li>Paste the code and connect.</li></ol>
-              <label className="connection-field"><span>Aircraft connection code</span><textarea ref={connectionField} value={connectionCode} onChange={(event) => setConnectionCode(event.target.value)} placeholder="AVIAN1.…" rows={4} spellCheck={false} autoCapitalize="none" autoCorrect="off" disabled={connectionPending} /></label>
+              <label className="connection-field"><span>Aircraft connection code</span><textarea ref={connectionField} value={connectionCode} onChange={(event) => setConnectionCode(event.target.value)} placeholder="AVIAN1.…" rows={4} spellCheck={false} autoCapitalize="none" autoCorrect="off" disabled={setupPending} /></label>
               <p className="connection-privacy"><ShieldCheck size={14} /> The code contains routing details only. Formation credentials stay in the local AVIAN agent.</p>
               {connectionError ? <p className="connection-message error" role="alert"><AlertTriangle size={15} />{connectionError}</p> : null}
               {displayedConnectionResult ? <p className={`connection-message ${displayedConnectionResult.connected ? "success" : "pending"}`} role="status">{displayedConnectionResult.connected ? <CheckCircle2 size={15} /> : <RefreshCw size={15} className="spinning" />}{displayedConnectionResult.connected ? `${displayedConnectionResult.name} is connected` : `${displayedConnectionResult.name} was saved; AVIAN is attempting the first connection`}</p> : null}
+              {removalResult ? <p className="connection-message success" role="status"><CheckCircle2 size={15} />{removalResult.name} was removed from this ground device</p> : null}
+              <section className="saved-connections" aria-labelledby="saved-connections-title">
+                <div className="saved-connections-heading"><div><strong id="saved-connections-title">Saved aircraft</strong><small>Connection-code pairings on this ground device</small></div><button type="button" onClick={() => void loadConnections()} disabled={setupPending}><RefreshCw size={13} /> Refresh</button></div>
+                {connectionListError ? <p className="saved-connections-error" role="alert"><AlertTriangle size={14} />{connectionListError}</p> : savedConnections.length ? <ul>{savedConnections.map((name) => {
+                  const connectedPeer = status?.peers.find((peer) => peer.name === name);
+                  const confirming = removeConfirmName === name;
+                  const removing = removalPending === name;
+                  return <li key={name}><span><strong>{name}</strong><small>{connectedPeer?.connected ? "Connected" : "Saved locally"}</small></span><div>{confirming ? <><button type="button" className="cancel-removal" onClick={() => setRemoveConfirmName(null)} disabled={removing}>Cancel</button><button type="button" className="confirm-removal" onClick={() => void removeAircraft(name)} disabled={removing}>{removing ? <RefreshCw size={13} className="spinning" /> : <Trash2 size={13} />}{removing ? "Removing…" : "Confirm remove"}</button></> : <button type="button" className="remove-connection" onClick={() => { setRemoveConfirmName(name); setConnectionError(null); setRemovalResult(null); }} disabled={setupPending}><Trash2 size={13} /> Remove</button>}</div></li>;
+                })}</ul> : <p className="saved-connections-empty">{connectionsLoaded ? "No connection-code aircraft are saved." : "Loading saved aircraft…"}</p>}
+                <p className="saved-connections-note">Removal stops reconnection from this ground device. It does not change the aircraft; previously synchronized telemetry may remain briefly as history.</p>
+              </section>
             </div>
-            <div className="dialog-actions"><button type="button" className="secondary-action" onClick={() => setConnectionOpen(false)} disabled={connectionPending}>Close</button><button type="button" className="primary-action" onClick={() => void connectAircraft()} disabled={connectionPending || !connectionCode.trim()}>{connectionPending ? <RefreshCw size={14} className="spinning" /> : <Link2 size={14} />}{connectionPending ? "Connecting…" : "Connect aircraft"}</button></div>
+            <div className="dialog-actions"><button type="button" className="secondary-action" onClick={() => setConnectionOpen(false)} disabled={setupPending}>Close</button><button type="button" className="primary-action" onClick={() => void connectAircraft()} disabled={setupPending || !connectionCode.trim()}>{connectionPending ? <RefreshCw size={14} className="spinning" /> : <Link2 size={14} />}{connectionPending ? "Connecting…" : "Connect aircraft"}</button></div>
           </section>
         </div>
       ) : null}

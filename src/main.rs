@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
-use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
@@ -359,7 +359,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/aircraft", get(aircraft))
         .route("/api/v1/records", get(records))
         .route("/api/v1/logs", get(logs))
-        .route("/api/v1/connections", post(connect_aircraft))
+        .route(
+            "/api/v1/connections",
+            get(list_connections).post(connect_aircraft),
+        )
+        .route(
+            "/api/v1/connections/{name}",
+            delete(remove_aircraft),
+        )
         .fallback_service(static_files)
         .layer(DefaultBodyLimit::max(MAX_SETUP_BODY_BYTES))
         .layer(ConcurrencyLimitLayer::new(64))
@@ -460,8 +467,21 @@ async fn health() -> impl IntoResponse {
         "observed_at_ms": unix_time_ms(),
         "read_only": true,
         "operations_read_only": true,
-        "connection_setup": true
+        "connection_setup": true,
+        "connection_removal": true
     }))
+}
+
+async fn list_connections(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let body = state
+        .avian
+        .request(json!({ "type": "list_paired_peers" }))
+        .await?;
+    if body.get("type").and_then(Value::as_str) != Some("paired_peers") {
+        return Err(control_error(body));
+    }
+    let names = decode_paired_peer_names(&body)?;
+    Ok(api_json(json!({ "connections": names })))
 }
 
 async fn connect_aircraft(
@@ -469,13 +489,7 @@ async fn connect_aircraft(
     headers: HeaderMap,
     Json(request): Json<ConnectRequest>,
 ) -> Result<Response, ApiError> {
-    if headers
-        .get("x-avian-setup")
-        .and_then(|value| value.to_str().ok())
-        != Some("1")
-    {
-        return Err(ApiError::forbidden("missing local setup confirmation"));
-    }
+    require_setup_confirmation(&headers)?;
     let connection = decode_connection_code(&request.code)?;
     let body = state
         .avian
@@ -518,6 +532,88 @@ async fn connect_aircraft(
             )
         })?;
     Ok(api_json(json!({ "name": name, "connected": connected })))
+}
+
+async fn remove_aircraft(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_setup_confirmation(&headers)?;
+    if !valid_setup_identifier(&name) {
+        return Err(ApiError::bad_request("aircraft name is invalid"));
+    }
+    let body = state
+        .avian
+        .request(json!({ "type": "remove_peer", "name": name }))
+        .await?;
+    if body.get("type").and_then(Value::as_str) == Some("error") {
+        let detail = body
+            .get("detail")
+            .and_then(Value::as_str)
+            .map(sanitize_message)
+            .unwrap_or_else(|| "aircraft removal was rejected".to_owned());
+        return Err(ApiError::bad_request(detail));
+    }
+    if body.get("type").and_then(Value::as_str) != Some("peer_removed") {
+        return Err(control_error(body));
+    }
+    let removed_name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| valid_setup_identifier(value) && *value == name)
+        .ok_or_else(|| {
+            ApiError::unavailable(
+                "invalid_control_response",
+                "removed peer name is missing or mismatched",
+            )
+        })?;
+    Ok(api_json(json!({ "name": removed_name, "removed": true })))
+}
+
+fn require_setup_confirmation(headers: &HeaderMap) -> Result<(), ApiError> {
+    if headers
+        .get("x-avian-setup")
+        .and_then(|value| value.to_str().ok())
+        == Some("1")
+    {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("missing local setup confirmation"))
+    }
+}
+
+fn decode_paired_peer_names(body: &Value) -> Result<Vec<String>, ApiError> {
+    let names = body.get("names").and_then(Value::as_array).ok_or_else(|| {
+        ApiError::unavailable(
+            "invalid_control_response",
+            "paired aircraft list is missing",
+        )
+    })?;
+    if names.len() > 1_000 {
+        return Err(ApiError::unavailable(
+            "invalid_control_response",
+            "paired aircraft list exceeds the local limit",
+        ));
+    }
+    let mut decoded = names
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|name| valid_setup_identifier(name))
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    ApiError::unavailable(
+                        "invalid_control_response",
+                        "paired aircraft list contains an invalid name",
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    decoded.sort();
+    decoded.dedup();
+    Ok(decoded)
 }
 
 fn decode_connection_code(value: &str) -> Result<ConnectionCode, ApiError> {
@@ -1397,6 +1493,38 @@ mod tests {
     }
 
     #[test]
+    fn paired_aircraft_list_is_validated_sorted_and_deduplicated() {
+        let body = json!({
+            "type": "paired_peers",
+            "names": ["aircraft-002", "aircraft-001", "aircraft-002"]
+        });
+        assert_eq!(
+            decode_paired_peer_names(&body).unwrap(),
+            vec!["aircraft-001", "aircraft-002"]
+        );
+        assert!(decode_paired_peer_names(&json!({
+            "type": "paired_peers",
+            "names": ["../aircraft"]
+        }))
+        .is_err());
+        assert!(decode_paired_peer_names(&json!({
+            "type": "paired_peers",
+            "names": vec!["aircraft"; 1_001]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn setup_mutations_require_an_explicit_local_confirmation_header() {
+        assert!(require_setup_confirmation(&HeaderMap::new()).is_err());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-avian-setup", HeaderValue::from_static("0"));
+        assert!(require_setup_confirmation(&headers).is_err());
+        headers.insert("x-avian-setup", HeaderValue::from_static("1"));
+        assert!(require_setup_confirmation(&headers).is_ok());
+    }
+
+    #[test]
     fn browser_projection_omits_addresses_credentials_payloads_and_images() {
         let input: StatusInput = serde_json::from_value(json!({
             "schema_version": 1,
@@ -1480,6 +1608,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response["status"]["ready"], true);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn removal_handler_sends_a_versioned_bounded_peer_request() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            let request: Value = serde_json::from_slice(&request).unwrap();
+            assert_eq!(request["protocol_version"], 1);
+            assert_eq!(request["body"]["type"], "remove_peer");
+            assert_eq!(request["body"]["name"], "aircraft-001");
+            stream
+                .write_all(
+                    br#"{"protocol_version":1,"body":{"type":"peer_removed","name":"aircraft-001"}}"#,
+                )
+                .await
+                .unwrap();
+        });
+        let state = AppState {
+            avian: AvianClient {
+                socket: Arc::new(socket),
+                max_message_bytes: 4_096,
+            },
+            journalctl: None,
+            authority: Arc::from("127.0.0.1:4178"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-avian-setup", HeaderValue::from_static("1"));
+        let response = remove_aircraft(State(state), AxumPath("aircraft-001".to_owned()), headers)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         server.await.unwrap();
     }
 }
