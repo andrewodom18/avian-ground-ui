@@ -1,0 +1,46 @@
+[Unit]
+Description=AVIAN read-only ground dashboard
+Documentation=https://github.com/andrewodom18/avian-ground-ui
+Wants=network-online.target avian-mesh-agent.service
+After=network-online.target avian-mesh-agent.service
+ConditionPathExists=/usr/local/share/avian-ground-ui/index.html
+
+[Service]
+Type=simple
+User=avian
+Group=avian
+SupplementaryGroups=systemd-journal
+UMask=0077
+ExecStart=/usr/local/bin/avian-ground-ui --assets /usr/local/share/avian-ground-ui --control-socket /run/avian/control.sock
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=10s
+NoNewPrivileges=yes
+AmbientCapabilities=
+CapabilityBoundingSet=
+PrivateDevices=yes
+PrivateMounts=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target
