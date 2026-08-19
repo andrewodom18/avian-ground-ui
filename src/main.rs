@@ -269,6 +269,7 @@ struct RecordInput {
 
 #[derive(Debug, Deserialize)]
 struct RecordBodyInput {
+    source: String,
     published_at_ms: u64,
 }
 
@@ -705,8 +706,13 @@ fn valid_setup_identifier(value: &str) -> bool {
 }
 
 async fn agent_status(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let body = state
-        .avian
+    let status = read_agent_status(&state.avian).await?;
+    let status = project_status(status)?;
+    Ok(api_json(json!({ "status": status })))
+}
+
+async fn read_agent_status(avian: &AvianClient) -> Result<StatusInput, ApiError> {
+    let body = avian
         .request(json!({ "type": "status", "require_ready": false }))
         .await?;
     if body.get("type").and_then(Value::as_str) != Some("status") {
@@ -716,11 +722,8 @@ async fn agent_status(State(state): State<AppState>) -> Result<Response, ApiErro
         .get("status")
         .cloned()
         .ok_or_else(|| ApiError::unavailable("invalid_control_response", "status is missing"))?;
-    let status: StatusInput = serde_json::from_value(status).map_err(|_| {
-        ApiError::unavailable("invalid_control_response", "status schema is invalid")
-    })?;
-    let status = project_status(status)?;
-    Ok(api_json(json!({ "status": status })))
+    serde_json::from_value(status)
+        .map_err(|_| ApiError::unavailable("invalid_control_response", "status schema is invalid"))
 }
 
 async fn records(
@@ -733,12 +736,14 @@ async fn records(
     if !(1..=100).contains(&query.limit) {
         return Err(ApiError::bad_request("record limit must be 1-100"));
     }
+    let status = read_agent_status(&state.avian).await?;
+    let visible_sources = visible_peer_sources(&status)?;
     let body = state
         .avian
         .request(json!({
             "type": "list_records",
             "class": query.class,
-            "limit": query.limit
+            "limit": 100
         }))
         .await?;
     if body.get("type").and_then(Value::as_str) != Some("records") {
@@ -751,11 +756,13 @@ async fn records(
     let records: Vec<RecordInput> = serde_json::from_value(records).map_err(|_| {
         ApiError::unavailable("invalid_control_response", "record schema is invalid")
     })?;
-    let records = project_records(records, query.limit);
+    let records = project_records(records, query.limit, visible_sources.as_ref());
     Ok(api_json(json!({ "records": records })))
 }
 
 async fn aircraft(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let status = read_agent_status(&state.avian).await?;
+    let visible_sources = visible_peer_sources(&status)?;
     let body = state
         .avian
         .request(json!({
@@ -778,14 +785,19 @@ async fn aircraft(State(state): State<AppState>) -> Result<Response, ApiError> {
         )
     })?;
     Ok(api_json(json!({
-        "aircraft": project_aircraft_records(records),
+        "aircraft": project_aircraft_records(records, visible_sources.as_ref()),
         "observed_at_ms": unix_time_ms()
     })))
 }
 
-fn project_records(records: Vec<RecordInput>, limit: u16) -> Vec<DashboardRecord> {
+fn project_records(
+    records: Vec<RecordInput>,
+    limit: u16,
+    visible_sources: Option<&BTreeSet<String>>,
+) -> Vec<DashboardRecord> {
     records
         .into_iter()
+        .filter(|view| visible_sources.is_none_or(|allowed| allowed.contains(&view.record.source)))
         .take(usize::from(limit))
         .map(|view| DashboardRecord {
             published_at_ms: view.record.published_at_ms,
@@ -797,7 +809,35 @@ fn is_allowed_record_class(class: &str) -> bool {
     matches!(class, "acknowledgement" | "bulk")
 }
 
-fn project_aircraft_records(records: Vec<TelemetryRecordInput>) -> Vec<DashboardAircraftTelemetry> {
+fn visible_peer_sources(status: &StatusInput) -> Result<Option<BTreeSet<String>>, ApiError> {
+    if status.schema_version != 1 {
+        return Err(ApiError::unavailable(
+            "invalid_control_response",
+            "unsupported status schema version",
+        ));
+    }
+    if status.peers.len() > 1_000 {
+        return Err(ApiError::unavailable(
+            "invalid_control_response",
+            "status peer limit exceeded",
+        ));
+    }
+    match status.node.role.as_str() {
+        "ground" => Ok(Some(
+            status.peers.iter().map(|peer| peer.name.clone()).collect(),
+        )),
+        "aircraft" | "observer" => Ok(None),
+        _ => Err(ApiError::unavailable(
+            "invalid_control_response",
+            "status contains an invalid node role",
+        )),
+    }
+}
+
+fn project_aircraft_records(
+    records: Vec<TelemetryRecordInput>,
+    visible_sources: Option<&BTreeSet<String>>,
+) -> Vec<DashboardAircraftTelemetry> {
     let mut sources = BTreeSet::new();
     records
         .into_iter()
@@ -810,6 +850,7 @@ fn project_aircraft_records(records: Vec<TelemetryRecordInput>) -> Vec<Dashboard
                 serde_json::from_value(view.record.payload.get("value")?.clone()).ok()?;
             if telemetry.source != view.record.source
                 || !valid_aircraft_telemetry(&telemetry)
+                || visible_sources.is_some_and(|allowed| !allowed.contains(&telemetry.source))
                 || !sources.insert(telemetry.source.clone())
             {
                 return None;
@@ -1326,7 +1367,7 @@ mod tests {
             }
         ]))
         .unwrap();
-        let projected = project_aircraft_records(records);
+        let projected = project_aircraft_records(records, None);
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].source, "mel-stardog");
         assert_eq!(projected[0].observed_at_ms, 1_950);
@@ -1364,7 +1405,7 @@ mod tests {
         }]))
         .unwrap();
 
-        let projected = project_aircraft_records(records);
+        let projected = project_aircraft_records(records, None);
         assert_eq!(projected.len(), 1);
         assert!(!projected[0].position_available);
     }
@@ -1398,8 +1439,60 @@ mod tests {
             }))
             .unwrap()
         };
-        assert!(project_aircraft_records(vec![record("air-a", "air-b", 27.0)]).is_empty());
-        assert!(project_aircraft_records(vec![record("air-a", "air-a", 127.0)]).is_empty());
+        assert!(project_aircraft_records(vec![record("air-a", "air-b", 27.0)], None).is_empty());
+        assert!(project_aircraft_records(vec![record("air-a", "air-a", 127.0)], None).is_empty());
+    }
+
+    #[test]
+    fn ground_aircraft_projection_hides_records_from_removed_peers() {
+        let record = |source: &str| {
+            serde_json::from_value::<TelemetryRecordInput>(json!({
+                "record": {
+                    "source": source,
+                    "published_at_ms": 2_000,
+                    "expires_at_ms": 4_000,
+                    "payload": {
+                        "kind": "telemetry",
+                        "value": {
+                            "source": source,
+                            "timestamp_ms": 1_950,
+                            "latitude_deg": 27.0,
+                            "longitude_deg": -82.0,
+                            "altitude": {"msl_m": 120.0, "agl_m": null, "above_launch_m": 40.0},
+                            "velocity_ned_mps": [0.0, 0.0, 0.0],
+                            "attitude_rpy_deg": [0.0, 0.0, 0.0],
+                            "battery_remaining": null,
+                            "control_link_quality": null,
+                            "armed": false,
+                            "landed": null,
+                            "failsafe": false
+                        }
+                    }
+                }
+            }))
+            .unwrap()
+        };
+        let visible = BTreeSet::from(["air-a".to_owned()]);
+        let projected =
+            project_aircraft_records(vec![record("air-a"), record("air-b")], Some(&visible));
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].source, "air-a");
+        assert!(project_aircraft_records(vec![record("air-a")], Some(&BTreeSet::new())).is_empty());
+    }
+
+    #[test]
+    fn ground_payload_projection_hides_records_from_removed_peers() {
+        let records = || {
+            serde_json::from_value::<Vec<RecordInput>>(json!([
+                {"record": {"source": "air-a", "published_at_ms": 2_000}},
+                {"record": {"source": "air-b", "published_at_ms": 1_000}}
+            ]))
+            .unwrap()
+        };
+        let visible = BTreeSet::from(["air-a".to_owned()]);
+        assert_eq!(project_records(records(), 20, Some(&visible)).len(), 1);
+        assert!(project_records(records(), 20, Some(&BTreeSet::new())).is_empty());
+        assert_eq!(project_records(records(), 20, None).len(), 2);
     }
 
     #[test]
@@ -1582,7 +1675,7 @@ mod tests {
             "record_id": "record-hash",
             "record": {"published_at_ms": 7, "source": "source-hash", "payload": {"jpeg": "/9j/secret", "path": "/field/image.jpg"}}
         }])).unwrap();
-        let encoded = serde_json::to_string(&project_records(records, 20)).unwrap();
+        let encoded = serde_json::to_string(&project_records(records, 20, None)).unwrap();
         for forbidden in ["record-hash", "source-hash", "payload", "/9j/", "/field/"] {
             assert!(
                 !encoded.contains(forbidden),

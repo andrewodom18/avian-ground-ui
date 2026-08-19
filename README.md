@@ -137,8 +137,11 @@ outbound reconnection attempts, and closes its currently tracked transport. It
 does not modify the aircraft or revoke formation membership or credentials.
 An authorized aircraft or formation peer can still establish an inbound or
 relayed mesh path, and synchronized telemetry remains subject to normal record
-retention. Paste the code again to restore the ground-initiated direct pairing.
-Static and managed-membership peers are never offered for removal.
+retention, but AVIAN Ground hides records from peers that are no longer
+configured. The aircraft card and peer row therefore disappear immediately and
+remain hidden after a refresh or restart. Paste the code again to restore the
+ground-initiated direct pairing and overview data. Static and
+managed-membership peers are never offered for removal.
 
 ## Flight operation
 

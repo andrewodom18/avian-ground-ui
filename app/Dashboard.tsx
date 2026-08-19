@@ -310,6 +310,8 @@ export function Dashboard() {
   const statusInFlight = useRef(false);
   const aircraftInFlight = useRef(false);
   const secondaryInFlight = useRef(false);
+  const hiddenAircraftNames = useRef(new Set<string>());
+  const dataVisibilityRevision = useRef(0);
   const connectionField = useRef<HTMLTextAreaElement>(null);
 
   const openConnection = useCallback(() => {
@@ -325,7 +327,10 @@ export function Dashboard() {
     statusInFlight.current = true;
     try {
       const response = await fetchJson("/api/v1/status", decodeStatusResponse);
-      setStatus(response.status);
+      setStatus({
+        ...response.status,
+        peers: response.status.peers.filter((peer) => !hiddenAircraftNames.current.has(peer.name)),
+      });
       setLastStatusAt(Date.now());
       setBridgeError(null);
     } catch (error) {
@@ -340,7 +345,7 @@ export function Dashboard() {
     aircraftInFlight.current = true;
     try {
       const response = await fetchJson("/api/v1/aircraft", decodeAircraftResponse);
-      setAircraft(response.aircraft);
+      setAircraft(response.aircraft.filter((item) => !hiddenAircraftNames.current.has(item.source)));
       setAircraftLoaded(true);
       setAircraftError(null);
     } catch (error) {
@@ -354,6 +359,7 @@ export function Dashboard() {
   const loadSecondary = useCallback(async () => {
     if (secondaryInFlight.current) return;
     secondaryInFlight.current = true;
+    const visibilityRevision = dataVisibilityRevision.current;
     try {
       const results = await Promise.allSettled([
         fetchJson("/api/v1/logs?lines=200", decodeLogResponse),
@@ -368,17 +374,19 @@ export function Dashboard() {
       } else {
         setLogError(fetchErrorLabel(results[0].reason, "Service logs"));
       }
-      if (results[1].status === "fulfilled") setBulkRecords(results[1].value.records);
-      if (results[2].status === "fulfilled") setAckRecords(results[2].value.records);
-      if (results[1].status === "fulfilled" && results[2].status === "fulfilled") {
-        setRecordsLoaded(true);
-        setRecordError(null);
-      } else {
-        const failures = [
-          results[1].status === "rejected" ? fetchErrorLabel(results[1].reason, "Payload manifests") : null,
-          results[2].status === "rejected" ? fetchErrorLabel(results[2].reason, "Payload acknowledgements") : null,
-        ].filter((value): value is string => value !== null);
-        setRecordError(failures.join("; "));
+      if (visibilityRevision === dataVisibilityRevision.current) {
+        if (results[1].status === "fulfilled") setBulkRecords(results[1].value.records);
+        if (results[2].status === "fulfilled") setAckRecords(results[2].value.records);
+        if (results[1].status === "fulfilled" && results[2].status === "fulfilled") {
+          setRecordsLoaded(true);
+          setRecordError(null);
+        } else {
+          const failures = [
+            results[1].status === "rejected" ? fetchErrorLabel(results[1].reason, "Payload manifests") : null,
+            results[2].status === "rejected" ? fetchErrorLabel(results[2].reason, "Payload acknowledgements") : null,
+          ].filter((value): value is string => value !== null);
+          setRecordError(failures.join("; "));
+        }
       }
     } finally {
       secondaryInFlight.current = false;
@@ -430,16 +438,18 @@ export function Dashboard() {
         throw new Error(detail);
       }
       const result = decodeConnectionResponse(payload);
+      hiddenAircraftNames.current.delete(result.name);
+      dataVisibilityRevision.current += 1;
       setConnectionResult(result);
       setConnectionCode("");
-      await Promise.all([loadStatus(), loadAircraft(), loadConnections()]);
+      await Promise.all([loadStatus(), loadAircraft(), loadSecondary(), loadConnections()]);
     } catch (error) {
       setConnectionError(fetchErrorLabel(error, "Aircraft connection"));
     } finally {
       window.clearTimeout(timer);
       setConnectionPending(false);
     }
-  }, [connectionCode, loadAircraft, loadConnections, loadStatus]);
+  }, [connectionCode, loadAircraft, loadConnections, loadSecondary, loadStatus]);
 
   const removeAircraft = useCallback(async (name: string) => {
     setRemovalPending(name);
@@ -462,16 +472,28 @@ export function Dashboard() {
         throw new Error(detail);
       }
       const result = decodeRemovalResponse(payload);
+      hiddenAircraftNames.current.add(result.name);
+      dataVisibilityRevision.current += 1;
       setRemovalResult(result);
       setRemoveConfirmName(null);
-      await Promise.all([loadStatus(), loadAircraft(), loadConnections()]);
+      setSavedConnections((current) => current.filter((value) => value !== result.name));
+      setStatus((current) => current ? {
+        ...current,
+        peers: current.peers.filter((peer) => peer.name !== result.name),
+      } : current);
+      setAircraft((current) => current.filter((item) => item.source !== result.name));
+      setBulkRecords([]);
+      setAckRecords([]);
+      setRecordsLoaded(true);
+      setRecordError(null);
+      await Promise.all([loadStatus(), loadAircraft(), loadSecondary(), loadConnections()]);
     } catch (error) {
       setConnectionError(fetchErrorLabel(error, "Aircraft removal"));
     } finally {
       window.clearTimeout(timer);
       setRemovalPending(null);
     }
-  }, [loadAircraft, loadConnections, loadStatus]);
+  }, [loadAircraft, loadConnections, loadSecondary, loadStatus]);
 
   useEffect(() => {
     if (!connectionOpen) return;
@@ -617,7 +639,7 @@ export function Dashboard() {
               <p className="connection-privacy"><ShieldCheck size={14} /> The code contains routing details only. Formation credentials stay in the local AVIAN agent.</p>
               {connectionError ? <p className="connection-message error" role="alert"><AlertTriangle size={15} />{connectionError}</p> : null}
               {displayedConnectionResult ? <p className={`connection-message ${displayedConnectionResult.connected ? "success" : "pending"}`} role="status">{displayedConnectionResult.connected ? <CheckCircle2 size={15} /> : <RefreshCw size={15} className="spinning" />}{displayedConnectionResult.connected ? `${displayedConnectionResult.name} is connected` : `${displayedConnectionResult.name} was saved; AVIAN is attempting the first connection`}</p> : null}
-              {removalResult ? <p className="connection-message success" role="status"><CheckCircle2 size={15} />{removalResult.name} was removed from saved direct peers</p> : null}
+              {removalResult ? <p className="connection-message success" role="status"><CheckCircle2 size={15} />{removalResult.name} was removed; its overview data is hidden</p> : null}
               <section className="saved-connections" aria-labelledby="saved-connections-title">
                 <div className="saved-connections-heading"><div><strong id="saved-connections-title">Saved aircraft</strong><small>Code-added direct peers on this ground device</small></div><button type="button" onClick={() => void loadConnections()} disabled={setupPending}><RefreshCw size={13} /> Refresh</button></div>
                 {connectionListError ? <p className="saved-connections-error" role="alert"><AlertTriangle size={14} />{connectionListError}</p> : savedConnections.length ? <ul>{savedConnections.map((name) => {
@@ -626,7 +648,7 @@ export function Dashboard() {
                   const removing = removalPending === name;
                   return <li key={name}><span><strong>{name}</strong><small>{connectedPeer?.connected ? "Connected" : "Saved locally"}</small></span><div>{confirming ? <><button type="button" className="cancel-removal" onClick={() => setRemoveConfirmName(null)} disabled={removing}>Cancel</button><button type="button" className="confirm-removal" onClick={() => void removeAircraft(name)} disabled={removing}>{removing ? <RefreshCw size={13} className="spinning" /> : <Trash2 size={13} />}{removing ? "Removing…" : "Confirm remove"}</button></> : <button type="button" className="remove-connection" onClick={() => { setRemoveConfirmName(name); setConnectionError(null); setRemovalResult(null); }} disabled={setupPending}><Trash2 size={13} /> Remove</button>}</div></li>;
                 })}</ul> : <p className="saved-connections-empty">{connectionsLoaded ? "No connection-code aircraft are saved." : "Loading saved aircraft…"}</p>}
-                <p className="saved-connections-note">Removal deletes the saved direct peer and stops outbound retries. It does not revoke formation access, so authorized telemetry may still arrive over an aircraft-initiated or relayed mesh path.</p>
+                <p className="saved-connections-note">Removal deletes the saved direct peer, stops outbound retries, and hides that aircraft&apos;s synchronized data from this overview. It does not erase local records or revoke formation access. Paste its code again to restore the view.</p>
               </section>
             </div>
             <div className="dialog-actions"><button type="button" className="secondary-action" onClick={() => setConnectionOpen(false)} disabled={setupPending}>Close</button><button type="button" className="primary-action" onClick={() => void connectAircraft()} disabled={setupPending || !connectionCode.trim()}>{connectionPending ? <RefreshCw size={14} className="spinning" /> : <Link2 size={14} />}{connectionPending ? "Connecting…" : "Connect aircraft"}</button></div>
@@ -684,7 +706,7 @@ export function Dashboard() {
               </div>
             </section>;
           })}</div> : <div className="empty-state aircraft-empty"><Plane size={19} /><span>{aircraftError ? "Aircraft feed unavailable" : aircraftLoaded ? "No aircraft telemetry has synchronized yet" : "Waiting for AVIAN mesh telemetry"}</span></div>}
-          <p className="panel-note">Telemetry is read from the local ground agent. If an aircraft link drops, the last synchronized snapshot remains visible and is marked stale.</p>
+          <p className="panel-note">Telemetry is read from the local ground agent. A link drop preserves the last synchronized snapshot as stale; removing the aircraft clears it from this overview.</p>
         </article>
 
         <article className="panel peer-panel">
@@ -731,7 +753,7 @@ export function Dashboard() {
           <PanelHeading eyebrow="PAYLOAD" title="Synchronization" detail={recordError ? "Record feed unavailable" : undefined} />
           <div className="payload-stats"><div><strong>{recordsLoaded ? bulkRecords.length : "—"}</strong><span>Recent manifests</span></div><div><strong>{recordsLoaded ? ackRecords.length : "—"}</strong><span>Recent acknowledgements</span></div><div><strong>{recordsLoaded ? timestampLabel(latestManifest) : "—"}</strong><span>Latest manifest</span></div></div>
           <div className="record-line"><ImageIcon size={15} /><span>Replicated AVIAN metadata</span><span>No image bytes</span></div>
-          <p className="panel-note">Metadata only. Image bytes and absolute imagery paths are never shown.</p>
+          <p className="panel-note">Metadata only. Image bytes and absolute imagery paths are never shown. Records from removed aircraft are excluded.</p>
         </article>
       </section>
 
