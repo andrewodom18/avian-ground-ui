@@ -746,10 +746,8 @@ fn validate_connection_addresses(
     }
     let mut unique = BTreeSet::new();
     for address in addresses {
-        if !matches!(
-            address.underlay.as_str(),
-            "silvus" | "ethernet" | "wifi" | "satellite" | "other"
-        ) || address.address.port() == 0
+        if !valid_underlay_name(&address.underlay)
+            || address.address.port() == 0
             || !valid_connection_ip(address.address.ip())
         {
             return Err(ApiError::bad_request("aircraft path is invalid"));
@@ -763,6 +761,13 @@ fn validate_connection_addresses(
         }
     }
     Ok(())
+}
+
+fn valid_underlay_name(value: &str) -> bool {
+    matches!(
+        value,
+        "silvus" | "ethernet" | "wifi" | "satellite" | "other"
+    )
 }
 
 fn validate_control_addresses(
@@ -1815,6 +1820,14 @@ mod tests {
             &[ConnectionAddress {
                 underlay: "wifi".into(),
                 address: "127.0.0.1:9000".parse().unwrap()
+            }],
+            true
+        )
+        .is_err());
+        assert!(validate_connection_addresses(
+            &[ConnectionAddress {
+                underlay: "Invalid Method".into(),
+                address: "192.0.2.9:9000".parse().unwrap()
             }],
             true
         )

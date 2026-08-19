@@ -162,6 +162,7 @@ h2 { margin-bottom:0; font-size:18px; letter-spacing:-.02em; }
 .path-item { padding:17px 18px; border-bottom:1px solid #eceeea; }
 .path-item:last-child { border-bottom:0; }
 .path-item>div { display:flex; align-items:center; gap:10px; }
+.path-item>div code { overflow-wrap:anywhere; color:var(--muted); font:600 10px var(--font-geist-mono),monospace; }
 .path-item>span { float:right; margin-top:-18px; color:var(--muted); font:600 10px var(--font-geist-mono),monospace; text-transform:uppercase; }
 .path-item dl { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin:18px 0 0; }
 .path-item dl div { display:flex; flex-direction:column; gap:3px; }

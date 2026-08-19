@@ -50,3 +50,12 @@ test("ground export is self-contained and omits command controls and source path
   assert.doesNotMatch(html, /emergency rtl|return to launch|issue command/i);
   assert.match(html, /metadata only/i);
 });
+
+test("dashboard has no built-in aircraft or underlay rows", async () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const source = await readFile(join(root, "app", "Dashboard.tsx"), "utf8");
+  assert.doesNotMatch(source, /mel-stardog|aircraft-001|UNDERLAY_OPTIONS/);
+  assert.doesNotMatch(source, /<option\s+value=["'](?:silvus|ethernet|wifi|satellite|other)["']/);
+  assert.match(source, /savedConnections\.flatMap/);
+  assert.match(source, /Object\.keys\(status\?\.underlays/);
+});

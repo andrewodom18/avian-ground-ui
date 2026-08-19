@@ -92,7 +92,7 @@ const AIRCRAFT_FRESH_MS = 5_000;
 const STATUS_POLL_INTERVAL_MS = 10_000;
 const SECONDARY_POLL_INTERVAL_MS = 30_000;
 const EVENT_PAGE_SIZE = 8;
-const UNDERLAY_OPTIONS = ["silvus", "ethernet", "wifi", "satellite", "other"] as const;
+const UNDERLAY_NAME = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -196,7 +196,7 @@ function decodeConnectionResponse(value: unknown): ConnectionResult {
 }
 
 function isConnectionPath(value: unknown): value is ConnectionPath {
-  return isObject(value) && UNDERLAY_OPTIONS.includes(value.underlay as typeof UNDERLAY_OPTIONS[number])
+  return isObject(value) && typeof value.underlay === "string" && UNDERLAY_NAME.test(value.underlay)
     && typeof value.address === "string" && value.address.length > 0;
 }
 
@@ -563,8 +563,16 @@ export function Dashboard() {
   }, [loadAircraft, loadStatus]);
 
   const addPath = useCallback((connection: SavedConnection) => {
-    const draft = pathDrafts[connection.name] ?? { underlay: "ethernet", address: "" };
+    const draft = pathDrafts[connection.name] ?? {
+      underlay: connection.paths[0]?.underlay ?? Object.keys(status?.underlays ?? {})[0] ?? "",
+      address: "",
+    };
+    const underlay = draft.underlay.trim().toLocaleLowerCase();
     const address = draft.address.trim();
+    if (!UNDERLAY_NAME.test(underlay)) {
+      setConnectionError("Choose a detected communication method or enter its AVIAN method name");
+      return;
+    }
     if (!address) {
       setConnectionError("Enter the aircraft IP address and AVIAN port, for example 10.20.30.40:9000");
       return;
@@ -573,9 +581,9 @@ export function Dashboard() {
       setConnectionError(`${address} is already configured for ${connection.name}`);
       return;
     }
-    void replacePaths(connection, [...connection.paths, { underlay: draft.underlay, address }]);
-    setPathDrafts((current) => ({ ...current, [connection.name]: { ...draft, address: "" } }));
-  }, [pathDrafts, replacePaths]);
+    void replacePaths(connection, [...connection.paths, { underlay, address }]);
+    setPathDrafts((current) => ({ ...current, [connection.name]: { underlay, address: "" } }));
+  }, [pathDrafts, replacePaths, status?.underlays]);
 
   useEffect(() => {
     if (!connectionOpen) return;
@@ -616,6 +624,18 @@ export function Dashboard() {
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [loadAircraft, loadSecondary, loadStatus, refresh]);
+
+  useEffect(() => {
+    if (status?.node.role !== "ground") return;
+    const initialTimer = window.setTimeout(() => void loadConnections(), 0);
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void loadConnections();
+    }, STATUS_POLL_INTERVAL_MS);
+    return () => {
+      window.clearTimeout(initialTimer);
+      window.clearInterval(timer);
+    };
+  }, [loadConnections, status?.node.role]);
 
   const disconnected = status?.peers.filter((peer) => !peer.connected) ?? [];
   const connected = (status?.peers.length ?? 0) - disconnected.length;
@@ -685,6 +705,16 @@ export function Dashboard() {
   const aircraftMetricState: MetricState = liveAircraft.length > 0 && staleAircraft.length === 0 ? "good"
     : aircraft.length > 0 ? "stale" : "warn";
   const setupPending = connectionPending || removalPending !== null || pathPending !== null;
+  const underlaySuggestions = useMemo(() => Array.from(new Set([
+    ...Object.keys(status?.underlays ?? {}),
+    ...savedConnections.flatMap((connection) => connection.paths.map((path) => path.underlay)),
+  ])).sort((left, right) => left.localeCompare(right)), [savedConnections, status?.underlays]);
+  const configuredPaths = useMemo(() => savedConnections.flatMap((connection) => connection.paths.map((path) => ({
+    aircraft: connection.name,
+    path,
+    health: status?.underlays[path.underlay] ?? null,
+    active: status?.peers.some((peer) => peer.name === connection.name && peer.connected && peer.selected_underlay === path.underlay) ?? false,
+  }))), [savedConnections, status?.peers, status?.underlays]);
 
   return (
     <main className="shell">
@@ -731,7 +761,10 @@ export function Dashboard() {
                   const confirming = removeConfirmName === connection.name;
                   const removing = removalPending === connection.name;
                   const changingPaths = pathPending === connection.name;
-                  const draft = pathDrafts[connection.name] ?? { underlay: "ethernet", address: "" };
+                  const draft = pathDrafts[connection.name] ?? {
+                    underlay: connectedPeer?.selected_underlay ?? connection.paths[0]?.underlay ?? underlaySuggestions[0] ?? "",
+                    address: "",
+                  };
                   return <li className="saved-connection-card" key={connection.name}>
                     <div className="saved-aircraft-row">
                       <span><strong>{connection.name}</strong><small>{connectedPeer?.connected ? `Connected${connectedPeer.selected_underlay ? ` via ${connectedPeer.selected_underlay}` : ""}` : connection.paths.length ? "Disconnected · retrying" : "Disconnected · no paths"}</small></span>
@@ -749,13 +782,14 @@ export function Dashboard() {
                       }) : <p className="no-paths-warning"><AlertTriangle size={14} />No paths configured. Telemetry remains visible as last known while this link-loss simulation is active.</p>}
                     </div>
                     <div className="add-path-row">
-                      <label><span>Method</span><select value={draft.underlay} onChange={(event) => setPathDrafts((current) => ({ ...current, [connection.name]: { ...draft, underlay: event.target.value } }))} disabled={setupPending}>{UNDERLAY_OPTIONS.map((underlay) => <option value={underlay} key={underlay}>{underlay}</option>)}</select></label>
+                      <label><span>Method</span><input type="text" list="avian-underlay-suggestions" value={draft.underlay} onChange={(event) => setPathDrafts((current) => ({ ...current, [connection.name]: { ...draft, underlay: event.target.value.toLocaleLowerCase() } }))} placeholder="Detected method" spellCheck={false} autoCapitalize="none" autoCorrect="off" disabled={setupPending} /></label>
                       <label className="path-address-field"><span>Aircraft address and port</span><input type="text" value={draft.address} onChange={(event) => setPathDrafts((current) => ({ ...current, [connection.name]: { ...draft, address: event.target.value } }))} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addPath(connection); } }} placeholder="10.20.30.40:9000" spellCheck={false} autoCapitalize="none" autoCorrect="off" disabled={setupPending || connection.paths.length >= 8} /></label>
-                      <button type="button" className="add-path-button" onClick={() => addPath(connection)} disabled={setupPending || !draft.address.trim() || connection.paths.length >= 8}><Plus size={13} /> Add path</button>
+                      <button type="button" className="add-path-button" onClick={() => addPath(connection)} disabled={setupPending || !draft.underlay.trim() || !draft.address.trim() || connection.paths.length >= 8}><Plus size={13} /> Add path</button>
                     </div>
                   </li>;
                 })}</ul> : <p className="saved-connections-empty">{connectionsLoaded ? "No connection-code aircraft are saved." : "Loading saved aircraft…"}</p>}
-                <p className="saved-connections-note"><strong>Test mode:</strong> remove paths to simulate lost communication methods, then add them back to simulate recovery. These controls change only AVIAN&apos;s saved routes; they never disable this computer&apos;s Wi-Fi, Ethernet, radio, or overlay interfaces. Removing an aircraft is separate and hides its overview data.</p>
+                <datalist id="avian-underlay-suggestions">{underlaySuggestions.map((underlay) => <option value={underlay} key={underlay} />)}</datalist>
+                <p className="saved-connections-note"><strong>Test mode:</strong> remove paths to simulate lost communication methods, then add them back to simulate recovery. The displayed aircraft and paths come from AVIAN&apos;s saved state; removing one removes it from this overview after refresh and restart. These controls never disable this computer&apos;s physical interfaces.</p>
               </section>
             </div>
             <div className="dialog-actions"><button type="button" className="secondary-action" onClick={() => setConnectionOpen(false)} disabled={setupPending}>Close</button><button type="button" className="primary-action" onClick={() => void connectAircraft()} disabled={setupPending || !connectionCode.trim()}>{connectionPending ? <RefreshCw size={14} className="spinning" /> : <Link2 size={14} />}{connectionPending ? "Connecting…" : "Connect aircraft"}</button></div>
@@ -829,13 +863,13 @@ export function Dashboard() {
         </article>
 
         <article className="panel path-panel">
-          <PanelHeading eyebrow="UNDERLAYS" title="Link health" detail={status?.node.role === "ground" ? "Auto selected" : undefined} />
-          {status && Object.keys(status.underlays).length > 0 ? Object.entries(status.underlays).map(([name, underlay]) => (
-            <div className="path-item" key={name}>
-              <div><span className={`status-dot ${underlay.reachable ? "good" : "bad"}`} /><strong>{name}</strong></div><span>{underlay.reachable ? "Reachable" : "Unavailable"}</span>
-              <dl><div><dt>Latency</dt><dd>{numberLabel(underlay.latency_ms, " ms")}</dd></div><div><dt>Loss</dt><dd>{underlay.loss_ratio == null ? "—" : `${(underlay.loss_ratio * 100).toFixed(1)}%`}</dd></div><div><dt>Stability</dt><dd>{underlay.stability == null ? "—" : `${Math.round(underlay.stability * 100)}%`}</dd></div></dl>
+          <PanelHeading eyebrow="UNDERLAYS" title="Configured path health" detail={status?.node.role === "ground" ? `${configuredPaths.length} saved` : undefined} />
+          {configuredPaths.length > 0 ? configuredPaths.map(({ aircraft: aircraftName, path, health, active }) => (
+            <div className="path-item" key={`${aircraftName}-${path.address}`}>
+              <div><span className={`status-dot ${health?.reachable ? "good" : "bad"}`} /><strong>{aircraftName}</strong><code>{path.underlay} · {path.address}</code></div><span>{active ? "Active" : health?.reachable ? "Observed" : "Unavailable"}</span>
+              <dl><div><dt>Latency</dt><dd>{numberLabel(health?.latency_ms, " ms")}</dd></div><div><dt>Loss</dt><dd>{health?.loss_ratio == null ? "—" : `${(health.loss_ratio * 100).toFixed(1)}%`}</dd></div><div><dt>Stability</dt><dd>{health?.stability == null ? "—" : `${Math.round(health.stability * 100)}%`}</dd></div></dl>
             </div>
-          )) : <div className="empty-state"><Satellite size={18} /><span>{status ? "No link observations available" : "Waiting for link observations"}</span></div>}
+          )) : <div className="empty-state"><Satellite size={18} /><span>{connectionsLoaded ? "No aircraft communication paths are saved" : status ? "Loading saved communication paths" : "Waiting for AVIAN"}</span></div>}
           {status?.node.role === "ground" ? <div className="path-management-callout"><span>AVIAN retries saved routes and selects the live transport automatically.</span><button type="button" onClick={openConnection}><Link2 size={13} /> Add or remove paths</button></div> : null}
         </article>
 

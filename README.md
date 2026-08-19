@@ -130,15 +130,24 @@ sudo avianctl connection-code \
 Connection codes are for simple pre-provisioned ground formations. Managed
 formations continue to use AVIAN membership manifests.
 
-The same panel lists every public communication path added by the code. AVIAN
-orders and retries the complete set automatically and reports the underlay that
-the live PEAT transport actually selected. To simulate a communication-method
-failure, select **Remove path** and **Confirm**. To simulate recovery, select an
-underlay, enter the aircraft's routable `IP:port`, and select **Add path**. The
-update is atomic and takes effect without restarting either service.
+The same panel lists every public communication path added by the code. Aircraft
+names and path rows are read from the local agent's persisted paired-peer state;
+the dashboard contains no built-in aircraft or path instances. Method
+suggestions come from saved paths and live local observations rather than a
+fixed UI list. AVIAN orders and retries the complete set automatically and
+reports the underlay that the live PEAT transport actually selected. To
+simulate a communication-method failure, select **Remove path** and **Confirm**.
+To simulate recovery, enter or choose the AVIAN method name, enter the
+aircraft's routable `IP:port`, and select **Add path**. The update is atomic and
+takes effect without restarting either service.
 On an unmanaged ground node, removed addresses also form an inbound deny case:
 if the aircraft dials back over a removed route, the agent closes that transport
 so the remote side cannot bypass the test.
+
+Each confirmed removal deletes that endpoint from the persisted descriptor and
+from the overview's configured-path health list; it remains absent after page
+refreshes and service restarts. Physical-interface probes may continue to run
+locally, but they do not recreate or display a deleted aircraft route.
 
 Removing the last path is allowed for complete-link-loss testing. The aircraft
 remains paired and visible as disconnected, and its last synchronized telemetry
